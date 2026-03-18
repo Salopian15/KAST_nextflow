@@ -9,6 +9,8 @@ params.gff = "genomic.gff"
 params.all_txt = "all.txt"
 params.go_txt = "go.txt"
 params.cds_list = "cds.list"
+params.stage3_mode = "coords"
+params.reference_contig = null
 
 process stage1 {
     input:
@@ -563,6 +565,90 @@ process stage3 {
     samtools view -S -b "${fasta_file.baseName}.sam" > "${fasta_file.baseName}.bam"
     samtools sort "${fasta_file.baseName}.bam" -o "${fasta_file.baseName}.sorted.bam"
     bedtools bamtobed -i "${fasta_file.baseName}.sorted.bam" > "${fasta_file.baseName}.sorted.bed"
+    bedtools intersect -a "${fasta_file.baseName}.sorted.bed" -b "${gff}" -wa -wb > "${fasta_file.baseName}.intersect"
+    '''
+}
+
+process stage3_coords {
+    input:
+    path fasta_file
+    path ref_genome
+    path gff
+    val win_size
+    val incr
+    val reference_contig
+
+    output:
+    path "${fasta_file.baseName}.intersect", emit: intersect_files
+
+    script:
+    '''
+    #!/bin/bash
+    cat << 'END_SCRIPT' > make_bed_from_segments.py
+import sys
+
+if len(sys.argv) != 6:
+    print("Usage: python make_bed_from_segments.py <segments_fasta> <ref_fasta> <window_size> <increment> <reference_contig_or_AUTO>")
+    sys.exit(1)
+
+segments_fasta = sys.argv[1]
+ref_fasta = sys.argv[2]
+window_size = int(sys.argv[3])
+increment = int(sys.argv[4])
+reference_contig = sys.argv[5]
+
+def read_contigs(ref_path):
+    contigs = []
+    with open(ref_path, "r") as fh:
+        for line in fh:
+            if line.startswith(">"):
+                contigs.append(line[1:].strip().split()[0])
+    return contigs
+
+contigs = read_contigs(ref_fasta)
+if not contigs:
+    print("ERROR: No FASTA headers found in reference genome")
+    sys.exit(1)
+
+if reference_contig == "AUTO":
+    if len(contigs) != 1:
+        print("ERROR: Multiple contigs found in reference and params.reference_contig is not set")
+        print("Contigs:", ",".join(contigs))
+        sys.exit(1)
+    contig = contigs[0]
+else:
+    if reference_contig not in contigs:
+        print(f"ERROR: reference_contig '{reference_contig}' was not found in reference genome")
+        print("Contigs:", ",".join(contigs))
+        sys.exit(1)
+    contig = reference_contig
+
+bed_out = f"{segments_fasta.rsplit('.', 1)[0]}.sorted.bed"
+with open(segments_fasta, "r") as in_fh, open(bed_out, "w") as out_fh:
+    for line in in_fh:
+        if not line.startswith(">"):
+            continue
+        header = line[1:].strip().split()[0]
+        try:
+            seg = int(header)
+        except ValueError:
+            print(f"ERROR: Segment header '{header}' is not an integer. Expected format '>123'.")
+            sys.exit(1)
+
+        start = (seg - 1) * increment
+        end = start + window_size
+        if start < 0:
+            print(f"ERROR: Computed negative start for segment {seg}")
+            sys.exit(1)
+        out_fh.write(f"{contig}\t{start}\t{end}\t{header}\n")
+END_SCRIPT
+
+    REF_CONTIG_INPUT="AUTO"
+    if [ -n "${reference_contig}" ] && [ "${reference_contig}" != "null" ]; then
+      REF_CONTIG_INPUT="${reference_contig}"
+    fi
+
+    python make_bed_from_segments.py "${fasta_file}" "${ref_genome}" "${win_size}" "${incr}" "$REF_CONTIG_INPUT"
     bedtools intersect -a "${fasta_file.baseName}.sorted.bed" -b "${gff}" -wa -wb > "${fasta_file.baseName}.intersect"
     '''
 }
@@ -1286,6 +1372,11 @@ END_SCRIPT
 }
 
 workflow {
+    def valid_stage3_modes = ["bwa", "coords"]
+    if( !valid_stage3_modes.contains(params.stage3_mode) ) {
+        error "Invalid --stage3_mode '${params.stage3_mode}'. Valid options: bwa, coords"
+    }
+
     fasta_ch = Channel.fromPath(params.fasta)
     ref_genome = file(params.ref_genome)
     gff_file = file(params.gff)
@@ -1295,7 +1386,14 @@ workflow {
 
     stage1_out = stage1(fasta_ch, params.window_size, params.kmer_length, params.increment)
     stage2_out = stage2(fasta_ch, stage1_out.dat_file, stage1_out.fwin_file)
-    stage3_out = stage3(stage2_out.filtered_seqs.flatten(), ref_genome, gff_file)
+    def stage3_input = stage2_out.filtered_seqs.flatten()
+    def stage3_out
+    if( params.stage3_mode == "bwa" ) {
+        stage3_out = stage3(stage3_input, ref_genome, gff_file)
+    }
+    else {
+        stage3_out = stage3_coords(stage3_input, ref_genome, gff_file, params.window_size as Integer, params.increment as Integer, params.reference_contig)
+    }
     stage4_out = stage4(stage3_out.intersect_files, cds_list)
     stage5_out = stage5(stage4_out.protein_files, all_txt, go_txt)
 }
