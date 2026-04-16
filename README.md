@@ -18,9 +18,7 @@ The workflow runs five stages:
 - Builds quantile-based FASTA subsets from D2 score distributions.
 - Produces cumulative and non-cumulative filtered FASTA files.
 
-3. Stage 3: Genomic coordinate intersection
-- Two selectable modes:
-  - bwa mode: aligns each filtered FASTA with BWA, converts to BED, intersects with GFF.
+3. Stage 3: Genomic coordinate intersection:
   - coords mode: skips alignment, derives BED coordinates from segment headers and intersects with GFF.
 
 4. Stage 4: Gene/protein extraction
@@ -37,8 +35,6 @@ The workflow expects these tools to be available in your runtime environment:
 - Python 3
 - Rscript
 - bedtools
-- BWA (required only in stage3_mode=bwa)
-- samtools (required only in stage3_mode=bwa)
 - KAST executable (kast)
 
 Python packages used in embedded scripts include:
