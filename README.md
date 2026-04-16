@@ -82,7 +82,6 @@ Stage 3 configuration:
 Use this when your stage2 FASTA headers are segment IDs like >123 and you already know window_size/increment.
 
 Behavior:
-- Skips BWA and samtools entirely.
 - Reconstructs BED intervals as:
   - start = (segment_id - 1) * increment
   - end = start + window_size
