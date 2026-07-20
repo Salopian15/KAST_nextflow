@@ -1,40 +1,117 @@
 nextflow.enable.dsl=2
 
-params.fasta = "Ref_genome.fasta"
-params.window_size = 5000
-params.kmer_length = 25
-params.increment = params.window_size / 2
-params.ref_genome = "Ref_genome.fasta"
-params.gff = "genomic.gff"
-params.all_txt = "all.txt"
-params.go_txt = "go.txt"
-params.cds_list = "cds.list"
-params.stage3_mode = "coords"
-params.reference_contig = null
+// ---- Parameters -----------------------------------------------------------
+params.fasta            = "Ref_genome.fasta"
+params.ref_genome       = "Ref_genome.fasta"
+params.window_size      = 100000    // paper default
+params.kmer_length      = 4         // KAST allocates 4^k; see --help for RAM scaling
+params.increment        = null      // derived: window_size / 2 (= 50000) if unset
+params.entropy_window   = 10000     // sub-window for entropy scan; MUST be < window_size
+params.entropy_incr     = null      // derived: entropy_window / 2 (= 5000) if unset
+params.gff              = "genomic.gff"
+params.all_txt          = "all.txt"
+params.go_txt           = "go.txt"
+params.cds_list         = "cds.list"
+params.obo              = "go-basic.obo"   // GO ontology; goatools will NOT fetch this for you
+params.top_quantile     = "0.95"           // quantile bin treated as the HGT candidate set in the report
+params.stage3_mode      = "coords"  // "coords" or "bwa"
+params.reference_contig = null      // required for multi-contig refs in coords mode
 
+params.help             = false
+
+// ---- Help -----------------------------------------------------------------
+def helpMessage() {
+    log.info """
+================================================================================
+ Alignment-free HGT detection pipeline
+================================================================================
+
+ USAGE
+   nextflow run main.nf [options]
+   nextflow run main.nf --help
+
+ INPUT FILES (defaults assume they sit in the launch directory)
+   --fasta <file>            Genome to scan                  [${params.fasta}]
+   --ref_genome <file>       Reference for KAST comparison   [${params.ref_genome}]
+   --gff <file>              Annotation, GFF3                [${params.gff}]
+   --cds_list <file>         TSV: GENE_NAME<TAB>PROTEIN_ID   [${params.cds_list}]
+   --all_txt <file>          Population protein IDs          [${params.all_txt}]
+   --go_txt <file>           TSV: PROTEIN_ID<TAB>GO:x;GO:y   [${params.go_txt}]
+   --obo <file>              GO ontology (not auto-fetched)  [${params.obo}]
+
+ WINDOWING
+   --window_size <int>       Window length in bp             [${params.window_size}]
+   --increment <int>         Step between windows            [window_size / 2]
+
+ SCORING
+   --kmer_length <int>       KAST k-mer length               [${params.kmer_length}]
+                             KAST allocates a dense 4^k array:
+                               k<=12  ~64 MB      k=14  ~1 GB
+                               k=15   ~4 GB       k=16  ~16 GB
+                             k>16 is impractical; k>=20 will refuse to run.
+                             KAST's own default is 3.
+
+ ENTROPY SCAN (sub-window scan inside each window; diagnostic plot only,
+ it does NOT affect which regions are called as HGT candidates)
+   --entropy_window <int>    Sub-window, MUST be < window_size [${params.entropy_window}]
+   --entropy_incr <int>      Sub-window step                   [entropy_window / 2]
+
+ COORDINATE MAPPING
+   --stage3_mode <str>       'coords' (arithmetic, fast) or
+                             'bwa' (align windows back)      [${params.stage3_mode}]
+   --reference_contig <str>  Contig name; required in coords
+                             mode when the reference has >1
+                             contig                          [${params.reference_contig ?: 'AUTO'}]
+
+ REPORTING
+   --top_quantile <str>      Quantile bin treated as the
+                             candidate set in the report     [${params.top_quantile}]
+
+ OUTPUT
+   results/dist/             Per-bin GO enrichment tables
+   results/report/           report.html, figures, candidate_regions.tsv
+
+ EXAMPLES
+   nextflow run main.nf --kmer_length 4
+   nextflow run main.nf --window_size 50000 --increment 25000
+   nextflow run main.nf --reference_contig NC_008095.1
+   nextflow run main.nf --stage3_mode bwa -resume
+================================================================================
+""".stripIndent()
+}
+
+if( params.help ) {
+    helpMessage()
+    exit 0
+}
+
+// ---- Stage 1: window, KAST Manhattan score, entropy, plot -----------------
 process stage1 {
     input:
     path fasta
     val win_size
     val klen
     val incr
+    val ent_win
+    val ent_incr
 
     output:
-    path "${fasta}.dat", emit: dat_file
-    path "win.${fasta}", emit: fwin_file
-    path "${fasta}.contam.pdf", emit: pdf_file
+    path "${fasta}.dat",         emit: dat_file
+    path "win.${fasta}",         emit: fwin_file
+    path "${fasta}.contam.pdf",  emit: pdf_file
 
-    script:
+    shell:
     '''
     #!/bin/bash
-    FWIN="win.${fasta}"
-    OUT="${fasta}.kast.out"
+    set -eo pipefail
+
+    FWIN="win.!{fasta}"
+    OUT="!{fasta}.kast.out"
 
     cat << 'END_SCRIPT' > fastaWindowed3.py
-#!/usr/bin/python
-import os, sys, shutil, string
-import subprocess
-from operator import itemgetter, attrgetter
+#!/usr/bin/env python3
+import sys
+from operator import itemgetter
 
 def processRecord(header, param, sequence, incr):
     new = header.replace(">", "")
@@ -43,13 +120,11 @@ def processRecord(header, param, sequence, incr):
         i = 0
         p1 = 0
         p2 = p1 + window
-
         while p2 < len(sequence):
             frag = sequence[p1:p2]
             p1 += incr
             p2 = p1 + window
             i += 1
-
             newHeader = f">{i}_{window}_{new}"
             print(newHeader)
             print(frag)
@@ -60,329 +135,203 @@ def main(afile, param, incr):
     with open(afile) as f_in:
         for line in f_in:
             line = line.strip()
-
-            if line[0] == ">":
+            if not line:
+                continue
+            if line.startswith(">"):
                 if header != "":
                     processRecord(header, param, sequence, incr)
-
                 header = line
                 sequence = ""
             else:
                 sequence += line
-
-        processRecord(header, param, sequence, incr)
+        if header != "":
+            processRecord(header, param, sequence, incr)
 
 def doit(argv):
     if len(argv) < 4:
         print("Chops a Fasta into windows e.g. size=2000, incr=1000")
-        print("USAGE: \$0 <fasta file> <windowSize> <incr>")
+        print("USAGE: $0 <fasta file> <windowSize> <incr>")
         sys.exit(0)
-
     afile = argv[1]
     param = int(argv[2])
     incr = int(argv[3])
-
     main(afile, param, incr)
 
 doit(sys.argv)
 END_SCRIPT
 
     cat << 'END_SCRIPT' > fastaEntropy3.py
-#!/usr/bin/python3
-import os, sys, shutil, string
-import subprocess
+#!/usr/bin/env python3
+import sys
 import math
-from operator import itemgetter, attrgetter
-import zlib
-# import lzma
-# lzObj = lzma.LZMACompressor()
+from operator import itemgetter
 
-### inner
 def defineKmers(klen, nletters):
-
-    # print(klen, nletters)
     if nletters == -4:
         letter = ["A", "C", "G", "T"]
-
     elif nletters == -40:
         letter = ["A", "C", "G", "U"]
         nletters = 4
-
-    elif nletters == 20:
-        letter = ['A', 'C', 'E', 'D', 'G', 'F', 'I', 'H', 'K', 'M', 'L', 'N', 'Q', 'P', 'S', 'R', 'T', 'W', 'V', 'Y']
-    elif nletters == 15:
-        letter = ['L', 'C', 'A', 'G', 'S', 'T', 'P', 'F', 'W', 'E', 'D', 'N', 'Q', 'K', 'H']
-    elif nletters == 10:
-        letter = ['L', 'C', 'A', 'G', 'S', 'P', 'F', 'E', 'K', 'H']
-    elif nletters == 8:
-        letter = ['L', 'A', 'S', 'P', 'F', 'E', 'K', 'H']
-    elif nletters == 4:
-        letter = ['L', 'A', 'F', 'E']
-    elif nletters == 2:
-        letter = ['L', 'E']
     else:
         print("ERROR: wrong number of letters!", nletters)
-        sys.exit()
-
-    if nletters == -40 or nletters == -4:
-        num = 4
-    else:
-        num = nletters
-
-    ## make k-mers by starting with k-mers of size 1, and grow them to required length
+        sys.exit(1)
+    num = 4
     kmers = list(letter)
-    kmer = ""
-    current = []
-    current.append(kmer)
-
-    for i in range(klen-1):
+    for _ in range(klen - 1):
         new = []
         for j in range(num):
             for kmer in kmers:
-                kmer = kmer + letter[j]
-                new.append(kmer)
+                new.append(kmer + letter[j])
         kmers = list(new)
     return kmers
 
-def addToKmers(kmers, letter):
-    i = 0
-    new = []
-    for kmer in kmers:
-        klast = list(kmer)[-1]
-        i = letter.index(klast)
-        while i < len(letter):
-            newk = kmer + letter[i]
-            new.append(newk)
-            i += 1
-    return new
-
 def countKmers(kmers, sequence, klen):
-    kmerCount = {}
-    for kmer in kmers:
-        kmerCount[kmer] = 0
+    kmerCount = {kmer: 0 for kmer in kmers}
     sequence = sequence.upper()
-    seqL = sequence
-    max = len(seqL) - klen
+    maxi = len(sequence) - klen
     i = 0
-    while i <= max:
-        j = i + klen
-        wordL = seqL[i:j]
-        word = "".join(wordL)
-        count = kmerCount.get(word, None)
-        if count is not None:
-            kmerCount[word] = kmerCount[word] + 1
-        i = i+1
+    while i <= maxi:
+        word = sequence[i:i + klen]
+        if word in kmerCount:
+            kmerCount[word] += 1
+        i += 1
     return kmerCount
 
+def calcEntropy(kmerCount, expectn, totalk):
+    shannon1 = shannon2 = 0.0
+    totalk = float(totalk)
+    if totalk <= 0:
+        return 0.0, 0.0
+    expect = float(expectn) / totalk
+    for word in kmerCount:
+        count = float(kmerCount[word])
+        if count > 0:
+            kfreq = count / totalk
+            shannon1 += kfreq * math.log(kfreq, 2)
+            shannon2 += expect * math.log(kfreq, 2)
+    return -shannon1, -shannon2
 
-
-def calcEntropy( kmerCount, expectn, totalk ) :
-
-   shannon1 = shannon2 = 0.0
-   totalk = float(totalk)
-   expect = float(expectn)/totalk
-   for word in kmerCount.keys() :
-     count = float(kmerCount[word])
-     if count > 0 :
-        kfreq = count/totalk
-        shannon1 += kfreq * math.log(kfreq,2)
-        shannon2 += expect * math.log(kfreq,2)
-
-   shannon1 = shannon1 * -1
-   shannon2 = shannon2 * -1
-
-   return shannon1,shannon2
-
-
-def processRecord(header, param, sequence, incr, mers1, mers2, mers3, mers4, mers5, f_o):
-
+def processRecord(header, param, sequence, incr, mers, f_o):
     new = header.replace(">", "")
     window = param
-    if len(sequence) >= window:
-
-        i = 0
-        p1 = 0
-        p2 = p1 + window
-        E = []
-
-        while p2 < len(sequence):
-
-            frag = sequence[p1:p2]
-            p1 += incr
-            p2 = p1 + window
-            i += 1
-
-            totH1 = totH2 = 0.0
-            kmers = []
-            for k in [1, 2, 3, 4, 5]:
-                if k == 1:
-                    kmers = mers1
-                elif k == 2:
-                    kmers = mers2
-                elif k == 3:
-                    kmers = mers3
-                elif k == 4:
-                    kmers = mers4
-                elif k == 5:
-                    kmers = mers5
-                else:
-                    print("No k-mer", k)
-                    continue
-
-                klen = len(kmers[0])
-                kmerCount = countKmers(kmers, frag, klen)
-
-                expectn = len(frag) / klen
-                totalk = len(frag) - klen
-                shan1, shan2 = calcEntropy(kmerCount, expectn, totalk)
-                totH1 += shan1
-                totH2 += shan2
-
-            E.append([p1, totH1, totH2])
-
-        [p1, totH1, totH2] = sorted(E, key=itemgetter(2))[0]
-
-        ostr = str(p1) + "\t" + str(totH1) + "\t" + str(totH2) + "\t" + new
-        f_o.write(ostr)
-        f_o.write("\n")
-        print(ostr)
-
+    if len(sequence) < window:
         return
-
+    p1 = 0
+    p2 = p1 + window
+    E = []
+    while p2 < len(sequence):
+        frag = sequence[p1:p2]
+        p1 += incr
+        p2 = p1 + window
+        totH1 = totH2 = 0.0
+        for kmers in mers:
+            klen = len(kmers[0])
+            kmerCount = countKmers(kmers, frag, klen)
+            expectn = len(frag) / klen
+            totalk = len(frag) - klen
+            shan1, shan2 = calcEntropy(kmerCount, expectn, totalk)
+            totH1 += shan1
+            totH2 += shan2
+        E.append([p1, totH1, totH2])
+    if not E:
+        return
+    p1, totH1, totH2 = sorted(E, key=itemgetter(2))[0]
+    ostr = str(p1) + "\\t" + str(totH1) + "\\t" + str(totH2) + "\\t" + new
+    f_o.write(ostr + "\\n")
 
 def main(afile, param, incr, f_o):
-
     nletters = -4
-    mers1 = defineKmers(1, nletters)
-    mers2 = defineKmers(2, nletters)
-    mers3 = defineKmers(3, nletters)
-    mers4 = defineKmers(4, nletters)
-    mers5 = defineKmers(5, nletters)
-
-    f_in = open(afile)
-
-    ostr = "#pos\t" + "H1\t" + "H2\t" + "SeqID"
-    f_o.write(ostr)
-    f_o.write("\n")
-
+    mers = [defineKmers(k, nletters) for k in [1, 2, 3, 4, 5]]
+    f_o.write("#pos\\tH1\\tH2\\tSeqID\\n")
     sequence = ""
     header = ""
-    for line in f_in:
-
-        line = line.strip()
-
-        if line[0] == ">":
-
-            if header != "":
-                processRecord(header, param, sequence, incr, mers1, mers2, mers3, mers4, mers5, f_o)
-
-            header = line
-            sequence = ""
-
-        else:
-            sequence = sequence + line
-
-    processRecord(header, param, sequence, incr, mers1, mers2, mers3, mers4, mers5, f_o)
-
-    f_in.close()
-
+    with open(afile) as f_in:
+        for line in f_in:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if header != "":
+                    processRecord(header, param, sequence, incr, mers, f_o)
+                header = line
+                sequence = ""
+            else:
+                sequence += line
+        if header != "":
+            processRecord(header, param, sequence, incr, mers, f_o)
 
 def doit(argv):
-
-    if len(argv) < 2:
-        print("Chops a Fasta into windows e.g. size=2000, incr=1000..")
-        print("Outputs lowest entropy window only for each sequence.")
-        print("USAGE: \$0 <fasta file> <max windowSize> <incr>")  # <kmer>")
-        exit(0)
-
+    if len(argv) < 4:
+        print("Outputs lowest-entropy sub-window per sequence.")
+        print("USAGE: $0 <fasta file> <window> <incr>")
+        sys.exit(0)
     afile = argv[1]
     maxWin = int(argv[2])
     incr = int(argv[3])
-
-    nletters = -4
-
-    ofile = afile + ".entropy"
-    f_o = open(ofile, "w")
-    main(afile, maxWin, incr, f_o)
-    f_o.close()
-
+    with open(afile + ".entropy", "w") as f_o:
+        main(afile, maxWin, incr, f_o)
 
 doit(sys.argv)
 END_SCRIPT
 
     cat << 'END_SCRIPT' > HGT.R
-#library("scatterplot3d")
-
 args <- commandArgs(TRUE)
 infile <- args[1]
 outfile <- args[2]
 myID <- args[3]
-#covLim <- args[4]
 
-
-w1 <- read.csv(file=infile,sep=",",head=TRUE)
-names(w1)
+w1 <- read.csv(file=infile, sep=",", head=TRUE)
 
 pdf(outfile)
+rbPal <- colorRampPalette(c('green','red'), alpha=TRUE)
 
-#Get mean coverage of longest 10 sequences (assuming data ordered)
-#covs <- w1\$Coverage[0:10]
-#mcov <- mean(covs)
-#covRange1 <- mcov * 2
-#covRange2 <- mcov * 20
+safeCut <- function(x) {
+    if (length(unique(x[!is.na(x)])) < 2) {
+        return(rep('black', length(x)))
+    }
+    rbPal(100)[as.numeric(cut(x, breaks = 100))]
+}
 
+w1$ColD <- safeCut(w1$D2score)
+w1$ColE <- safeCut(w1$Entropy)
 
-#mcov
-
-
-
-#rbPal <- colorRampPalette(c('red','yellow','green','blue','purple'),alpha=TRUE)
-rbPal <- colorRampPalette(c('green','red'),alpha=TRUE)
-w1\$ColD <- rbPal(100)[as.numeric(cut(w1\$D2score,breaks = 100))]
-w1\$ColE <- rbPal(100)[as.numeric(cut(w1\$Entropy,breaks = 100))]
-w1\$ColN <- rbPal(100)[as.numeric(cut(w1\$Number,breaks = 100))]
-
-
-
-#scatterplot3d(w1)
 par(mfrow=c(2,1))
-
-title1<-paste(myID,"   K-mer stat")
-title2<-paste(myID,"   Entropy")
-
-plot(w1\$Number,w1\$D2score,main=title1,xlab="Position", ylab="Stat1", pch=20, col=w1\$ColE )   #, xlim=c(0,covRange2) )
-plot(w1\$Number,w1\$Entropy,main=title2,xlab="Position", ylab="Stat2", pch=20, col=w1\$ColD ) #, xlim=c(0,covRange2) )
-
-
-
+title1 <- paste(myID, "   K-mer stat")
+title2 <- paste(myID, "   Entropy")
+plot(w1$Number, w1$D2score, main=title1, xlab="Position", ylab="Stat1", pch=20, col=w1$ColE)
+plot(w1$Number, w1$Entropy, main=title2, xlab="Position", ylab="Stat2", pch=20, col=w1$ColD)
+invisible(dev.off())
 END_SCRIPT
 
-    command -v kast >/dev/null 2>&1 || { echo "ERROR: 'kast' is not in PATH"; exit 1; }
+    command -v kast    >/dev/null 2>&1 || { echo "ERROR: 'kast' is not in PATH";    exit 1; }
+    command -v python3 >/dev/null 2>&1 || { echo "ERROR: 'python3' is not in PATH"; exit 1; }
+    command -v Rscript >/dev/null 2>&1 || { echo "ERROR: 'Rscript' is not in PATH"; exit 1; }
 
-    python fastaWindowed3.py "${fasta}" "${win_size}" "${incr}" > "$FWIN"
+    python3 fastaWindowed3.py "!{fasta}" "!{win_size}" "!{incr}" > "$FWIN"
 
-    T="manhattan"
-    kast -q "$FWIN" -r "${fasta}" -t "$T" -k "${klen}" -o "$OUT.1" -n 0 -f blastlike -nh
+    kast -q "$FWIN" -r "!{fasta}" -t "manhattan" -k "!{klen}" -o "$OUT.1" -n 0 -f blastlike -nh
 
-    python fastaEntropy3.py "$FWIN" "${win_size}" "${incr}" > "$OUT.3"
+    python3 fastaEntropy3.py "$FWIN" "!{ent_win}" "!{ent_incr}"
+    mv "$FWIN.entropy" "$OUT.3"
 
-    echo "D2score,Number,Entropy" > "${fasta}.dat"
-    cat "$OUT.1" | cut -f 2 | cut -d '_' -f 1  > tmp.2
-    cat "$OUT.1" | cut -f 6 > tmp.1
-    cat "$OUT.3" | grep -v '#' | cut -f 3 > tmp.3
+    echo "D2score,Number,Entropy" > "!{fasta}.dat"
+    cut -f 2 "$OUT.1" | cut -d '_' -f 1 > tmp.2
+    cut -f 6 "$OUT.1"                   > tmp.1
+    grep -v '#' "$OUT.3" | cut -f 3     > tmp.3
 
-    c1=$(wc -l < tmp.1); c3=$(wc -l < tmp.3)
-    if [ "$c1" != "$c3" ]; then
-        echo "ERROR: KAST output ($c1 rows) and entropy output ($c3 rows) have different row counts — possible ordering mismatch"
+    c1=$(wc -l < tmp.1); c2=$(wc -l < tmp.2); c3=$(wc -l < tmp.3)
+    if [ "$c1" != "$c3" ] || [ "$c1" != "$c2" ]; then
+        echo "ERROR: KAST rows ($c1) / segment rows ($c2) / entropy rows ($c3) differ — ordering mismatch"
         exit 1
     fi
 
-    paste -d ',' tmp.1 tmp.2 tmp.3 >> "${fasta}.dat"
+    paste -d ',' tmp.1 tmp.2 tmp.3 >> "!{fasta}.dat"
 
-    Rscript HGT.R "${fasta}.dat" "${fasta}.contam.pdf" "${fasta}"
+    Rscript HGT.R "!{fasta}.dat" "!{fasta}.contam.pdf" "!{fasta}"
     '''
 }
 
+// ---- Stage 2: map scores back to sequences, quantile-filter ---------------
 process stage2 {
     input:
     path fasta
@@ -391,173 +340,118 @@ process stage2 {
 
     output:
     path "Filtered_sequences/*.fasta", emit: filtered_seqs
+    path "quantile_statistics.txt",    emit: quantile_stats
 
-    script:
+    shell:
     '''
     #!/bin/bash
+    set -eo pipefail
+
     cat << 'END_SCRIPT' > kastdatWindowedfasta.py
+# NOTE: assumes a single-contig reference (Number is a per-record window index).
 from Bio import SeqIO
 import pandas as pd
-import sys
-import csv
+import sys, csv, os
 
-score_file = sys.argv[1]  # The score file name
-dna_file = sys.argv[2]  # The DNA file name
-output_file = sys.argv[3]  # The output file name
+score_file = sys.argv[1]
+dna_file = sys.argv[2]
+output_file = sys.argv[3]
 
-import os
 if not os.path.exists(score_file):
-    print(f"ERROR: Score file not found: {score_file}")
-    sys.exit(1)
+    print(f"ERROR: Score file not found: {score_file}"); sys.exit(1)
 if not os.path.exists(dna_file):
-    print(f"ERROR: DNA file not found: {dna_file}")
-    sys.exit(1)
+    print(f"ERROR: DNA file not found: {dna_file}"); sys.exit(1)
 
-sequences = {
-    "Segment": [],
-    "D2 Score": [],
-    "Sequence": []
-}
+dna_list = [str(rec.seq) for rec in SeqIO.parse(dna_file, "fasta")]
 
-# Read the DNA sequences from the file and store them in a list
-dna_list = []
-with open(dna_file, "r") as f:
-    for record in SeqIO.parse(f, "fasta"):
-        dna_list.append(str(record.seq))
-
-# Read the scores and corresponding segments from the score file
+rows = {"Segment": [], "D2 Score": [], "Sequence": []}
 with open(score_file, newline='') as csvfile:
     reader = csv.DictReader(csvfile)
     for row in reader:
         if 'Number' in row and 'D2score' in row:
             segment = int(row['Number'])
-            d2score = float(row['D2score'])
-            # Append the segment and score to the dictionary
-            sequences['Segment'].append(segment)
-            sequences['D2 Score'].append(d2score)
-            sequences['Sequence'].append(dna_list[segment - 1])
+            if segment < 1 or segment > len(dna_list):
+                continue
+            rows['Segment'].append(segment)
+            rows['D2 Score'].append(float(row['D2score']))
+            rows['Sequence'].append(dna_list[segment - 1])
 
-
-
-# Create the dataframe from the dictionary
-df = pd.DataFrame(sequences)
-print(df.head)
-
-
-
-# Save the dataframe to the output file
+df = pd.DataFrame(rows)
 df.to_csv(output_file, index=False)
 END_SCRIPT
 
     cat << 'END_SCRIPT' > D2kaststats.py
 import pandas as pd
-import numpy as np
 import sys
 
 csvfile = sys.argv[1]
 output_file = "quantile_statistics.txt"
-
-# Load the CSV file
 df = pd.read_csv(csvfile)
 
-# Ensure the 'D2score' column exists
 if 'D2score' not in df.columns:
-    print("The 'D2score' column does not exist in the CSV file.")
-else:
-    # Calculate the statistics
-    quantiles = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
-    quantile_stats = {q: df['D2score'].quantile(q) for q in quantiles}
+    print("The 'D2score' column does not exist in the CSV file."); sys.exit(1)
 
-    # Write the statistics to the output file
-    with open(output_file, 'w') as f:
-        for q, value in quantile_stats.items():
-            f.write(f"Quantile {q}: {value}\n")
-
-    print("Quantile statistics have been written to the file:", output_file)
+quantiles = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
+             0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+with open(output_file, 'w') as f:
+    for q in quantiles:
+        f.write(f"Quantile {q}: {df['D2score'].quantile(q)}\\n")
 END_SCRIPT
 
     cat << 'END_SCRIPT' > D2_filterCumulative.py
-import sys 
-import pandas as pd 
-import os 
-if len(sys.argv) < 2: 
-    print("Usage: python D2_filter.py input.csv output_folder") 
-    sys.exit() 
-csv_input = sys.argv[1] 
-output_folder = sys.argv[2] 
-df = pd.read_csv(csv_input) 
-quantiles_file = "quantile_statistics.txt" 
-quantiles = {} 
-if not os.path.exists(output_folder):  # Check if the output folder exists, if not, create it 
-    os.makedirs(output_folder) 
-with open(quantiles_file, 'r') as file: 
-    for line in file: 
-        parts = line.split(":") 
-        quantile = float(parts[0].split()[1]) 
-        value = float(parts[1].strip()) 
-        quantiles[quantile] = value 
-print(quantiles) 
-for i, quantile in enumerate(quantiles): 
-    lower = 0 if i == 0 else list(quantiles.values())[i-1] 
+import sys, os
+import pandas as pd
+
+if len(sys.argv) < 3:
+    print("Usage: python D2_filterCumulative.py input.csv output_folder"); sys.exit(1)
+
+csv_input = sys.argv[1]
+output_folder = sys.argv[2]
+os.makedirs(output_folder, exist_ok=True)
+
+df = pd.read_csv(csv_input)
+
+quantiles = {}
+with open("quantile_statistics.txt") as fh:
+    for line in fh:
+        parts = line.split(":")
+        quantiles[float(parts[0].split()[1])] = float(parts[1].strip())
+
+def write_fasta(rows, path):
+    with open(path, 'w') as out:
+        for _, row in rows.iterrows():
+            out.write(f">{row['Segment']}\\n{row['Sequence']}\\n")
+
+qkeys = list(quantiles)
+for i, quantile in enumerate(qkeys):
+    lower = 0 if i == 0 else quantiles[qkeys[i - 1]]
     upper = quantiles[quantile]
-    # Modify the filtering to include the upper bound 
-    score_select = df[(df["D2 Score"] >= lower) & (df["D2 Score"] <= upper)] 
-    output_file = f"{output_folder}/quantile_{lower}_{quantile}.fasta"
-    with open(output_file, 'w') as fasta_output:
-        for index, row in score_select.iterrows():
-            sequence_id = f">{row['Segment']}"
-            sequence = row['Sequence']
-            #print(f"Number of rows for range {lower}-{upper}: {len(score_select)}")
-            fasta_output.write(f"{sequence_id}\n{sequence}\n")
-    #print(f"Output file created: {output_file}")
+    sel = df[(df["D2 Score"] >= lower) & (df["D2 Score"] <= upper)]
+    write_fasta(sel, f"{output_folder}/quantile_{lower}_{quantile}.fasta")
 
-# Handle scores that are greater than the last quantile
-lower = list(quantiles.values())[-1]
-upper = float('inf')
-score_select = df[df["D2 Score"] >= lower]
-output_file = f"{output_folder}/quantile_0.95_inf.fasta"
-with open(output_file, 'w') as fasta_output:
-    for index, row in score_select.iterrows():
-        sequence_id = f">{row['Segment']}"
-        sequence = row['Sequence']
-        fasta_output.write(f"{sequence_id}\n{sequence}\n")
-#print(f"Output file created: {output_file}")
+lower = quantiles[qkeys[-1]]
+write_fasta(df[df["D2 Score"] >= lower], f"{output_folder}/quantile_0.95_inf.fasta")
 
-# Cumulative sections
-
-for quantile in quantiles:
-    lower = 0
+for quantile in qkeys:
     upper = quantiles[quantile]
-    score_select = df[(df["D2 Score"] >= lower) & (df["D2 Score"] <= upper)] 
-    output_file = f"{output_folder}/Cumulative_0_{quantile}.fasta"
-    with open(output_file, 'w') as fasta_output:
-        for index, row in score_select.iterrows():
-            sequence_id = f">{row['Segment']}"
-            sequence = row['Sequence']
-            fasta_output.write(f"{sequence_id}\n{sequence}\n")
-    #print(f"Output file created: {output_file}")
+    write_fasta(df[df["D2 Score"] <= upper], f"{output_folder}/Cumulative_0_{quantile}.fasta")
 
-for quantile in quantiles:
+for quantile in qkeys:
     lower = quantiles[quantile]
-    upper = float('inf')
-    score_select = df[(df["D2 Score"] >= lower) & (df["D2 Score"] <= upper)] 
-    output_file = f"{output_folder}/Cumulative_{quantile}_inf.fasta"
-    with open(output_file, 'w') as fasta_output:
-        for index, row in score_select.iterrows():
-            sequence_id = f">{row['Segment']}"
-            sequence = row['Sequence']
-            fasta_output.write(f"{sequence_id}\n{sequence}\n")
-    #print(f"Output file created: {output_file}")
+    write_fasta(df[df["D2 Score"] >= lower], f"{output_folder}/Cumulative_{quantile}_inf.fasta")
 END_SCRIPT
 
-    python kastdatWindowedfasta.py "${dat_file}" "${fwin_file}" "${fasta}.csv"
-    python D2kaststats.py "${dat_file}"
-    
+    command -v python3 >/dev/null 2>&1 || { echo "ERROR: 'python3' is not in PATH"; exit 1; }
+
+    python3 kastdatWindowedfasta.py "!{dat_file}" "!{fwin_file}" "!{fasta}.csv"
+    python3 D2kaststats.py "!{dat_file}"
+
     mkdir -p Filtered_sequences
-    python D2_filterCumulative.py "${fasta}.csv" Filtered_sequences
+    python3 D2_filterCumulative.py "!{fasta}.csv" Filtered_sequences
     '''
 }
 
+// ---- Stage 3 (bwa mode): align filtered windows, intersect with GFF -------
 process stage3 {
     input:
     path fasta_file
@@ -567,18 +461,26 @@ process stage3 {
     output:
     path "${fasta_file.baseName}.intersect", emit: intersect_files
 
-    script:
+    shell:
     '''
     #!/bin/bash
-    bwa index "${ref_genome}"
-    bwa mem "${ref_genome}" "${fasta_file}" > "${fasta_file.baseName}.sam"
-    samtools view -S -b "${fasta_file.baseName}.sam" > "${fasta_file.baseName}.bam"
-    samtools sort "${fasta_file.baseName}.bam" -o "${fasta_file.baseName}.sorted.bam"
-    bedtools bamtobed -i "${fasta_file.baseName}.sorted.bam" > "${fasta_file.baseName}.sorted.bed"
-    bedtools intersect -a "${fasta_file.baseName}.sorted.bed" -b "${gff}" -wa -wb > "${fasta_file.baseName}.intersect"
+    set -eo pipefail
+
+    for tool in bwa samtools bedtools; do
+        command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: '$tool' is not in PATH"; exit 1; }
+    done
+
+    BASE="!{fasta_file.baseName}"
+    bwa index "!{ref_genome}"
+    bwa mem "!{ref_genome}" "!{fasta_file}" > "$BASE.sam"
+    samtools view -S -b "$BASE.sam" > "$BASE.bam"
+    samtools sort "$BASE.bam" -o "$BASE.sorted.bam"
+    bedtools bamtobed -i "$BASE.sorted.bam" > "$BASE.sorted.bed"
+    bedtools intersect -a "$BASE.sorted.bed" -b "!{gff}" -wa -wb > "$BASE.intersect"
     '''
 }
 
+// ---- Stage 3 (coords mode): map segment index -> reference coordinates -----
 process stage3_coords {
     input:
     path fasta_file
@@ -591,14 +493,18 @@ process stage3_coords {
     output:
     path "${fasta_file.baseName}.intersect", emit: intersect_files
 
-    script:
+    shell:
     '''
     #!/bin/bash
+    set -eo pipefail
+
     cat << 'END_SCRIPT' > make_bed_from_segments.py
+# Emits a 6-column BED (chrom,start,end,name,score,strand) so column offsets
+# match the bwa/bamtobed path consumed by stage4.
 import sys
 
 if len(sys.argv) != 6:
-    print("Usage: python make_bed_from_segments.py <segments_fasta> <ref_fasta> <window_size> <increment> <reference_contig_or_AUTO>")
+    print("Usage: make_bed_from_segments.py <segments_fasta> <ref_fasta> <window_size> <increment> <contig|AUTO>")
     sys.exit(1)
 
 segments_fasta = sys.argv[1]
@@ -607,9 +513,9 @@ window_size = int(sys.argv[3])
 increment = int(sys.argv[4])
 reference_contig = sys.argv[5]
 
-def read_contigs(ref_path):
+def read_contigs(path):
     contigs = []
-    with open(ref_path, "r") as fh:
+    with open(path) as fh:
         for line in fh:
             if line.startswith(">"):
                 contigs.append(line[1:].strip().split()[0])
@@ -617,24 +523,21 @@ def read_contigs(ref_path):
 
 contigs = read_contigs(ref_fasta)
 if not contigs:
-    print("ERROR: No FASTA headers found in reference genome")
-    sys.exit(1)
+    print("ERROR: No FASTA headers found in reference genome"); sys.exit(1)
 
 if reference_contig == "AUTO":
     if len(contigs) != 1:
-        print("ERROR: Multiple contigs found in reference and params.reference_contig is not set")
-        print("Contigs:", ",".join(contigs))
-        sys.exit(1)
+        print("ERROR: Multiple contigs in reference and --reference_contig not set")
+        print("Contigs:", ",".join(contigs)); sys.exit(1)
     contig = contigs[0]
 else:
     if reference_contig not in contigs:
-        print(f"ERROR: reference_contig '{reference_contig}' was not found in reference genome")
-        print("Contigs:", ",".join(contigs))
-        sys.exit(1)
+        print(f"ERROR: reference_contig '{reference_contig}' not found in reference")
+        print("Contigs:", ",".join(contigs)); sys.exit(1)
     contig = reference_contig
 
 bed_out = f"{segments_fasta.rsplit('.', 1)[0]}.sorted.bed"
-with open(segments_fasta, "r") as in_fh, open(bed_out, "w") as out_fh:
+with open(segments_fasta) as in_fh, open(bed_out, "w") as out_fh:
     for line in in_fh:
         if not line.startswith(">"):
             continue
@@ -642,109 +545,100 @@ with open(segments_fasta, "r") as in_fh, open(bed_out, "w") as out_fh:
         try:
             seg = int(header)
         except ValueError:
-            print(f"ERROR: Segment header '{header}' is not an integer. Expected format '>123'.")
-            sys.exit(1)
-
+            print(f"ERROR: Segment header '{header}' is not an integer."); sys.exit(1)
         start = (seg - 1) * increment
         end = start + window_size
         if start < 0:
-            print(f"ERROR: Computed negative start for segment {seg}")
-            sys.exit(1)
-        out_fh.write(f"{contig}\t{start}\t{end}\t{header}\n")
+            print(f"ERROR: Negative start for segment {seg}"); sys.exit(1)
+        out_fh.write(f"{contig}\\t{start}\\t{end}\\t{header}\\t.\\t+\\n")
 END_SCRIPT
 
-    REF_CONTIG_INPUT="AUTO"
-    if [ -n "${reference_contig}" ] && [ "${reference_contig}" != "null" ]; then
-      REF_CONTIG_INPUT="${reference_contig}"
-    fi
+    command -v bedtools >/dev/null 2>&1 || { echo "ERROR: 'bedtools' is not in PATH"; exit 1; }
+    command -v python3  >/dev/null 2>&1 || { echo "ERROR: 'python3' is not in PATH";  exit 1; }
 
-    python make_bed_from_segments.py "${fasta_file}" "${ref_genome}" "${win_size}" "${incr}" "$REF_CONTIG_INPUT" || { echo "ERROR: make_bed_from_segments.py failed — check segment headers and reference_contig parameter"; exit 1; }
-    bedtools intersect -a "${fasta_file.baseName}.sorted.bed" -b "${gff}" -wa -wb > "${fasta_file.baseName}.intersect"
+    BASE="!{fasta_file.baseName}"
+    python3 make_bed_from_segments.py "!{fasta_file}" "!{ref_genome}" "!{win_size}" "!{incr}" "!{reference_contig}" \
+        || { echo "ERROR: make_bed_from_segments.py failed"; exit 1; }
+    bedtools intersect -a "$BASE.sorted.bed" -b "!{gff}" -wa -wb > "$BASE.intersect"
     '''
 }
 
+// ---- Stage 4: extract CDS gene names, convert to protein IDs ---------------
 process stage4 {
     input:
     path intersect_file
     path cds_list
 
     output:
-    path "${intersect_file}.gene", emit: gene_files
+    path "${intersect_file}.gene",    emit: gene_files
     path "${intersect_file}.protein", emit: protein_files
 
-    script:
+    shell:
     '''
     #!/bin/bash
+    set -eo pipefail
+
     cat << 'END_SCRIPT' > ProteinIntersect.py
 import pandas as pd
-import sys
+import sys, os
 
-# Check if the correct number of command-line arguments is provided
 if len(sys.argv) != 3:
-    print("Usage: python script.py input_file output_file")
-    sys.exit(1)
+    print("Usage: ProteinIntersect.py input_file output_file"); sys.exit(1)
 
-# Extract command-line arguments
-input_file = sys.argv[1]
-output_file = sys.argv[2]
+input_file, output_file = sys.argv[1], sys.argv[2]
 
-# Read the input file into a DataFrame
-df = pd.read_csv(input_file, sep='\t', header=None)
+# Empty intersect (window mapped nowhere) -> empty gene list, not an error.
+if not os.path.exists(input_file) or os.path.getsize(input_file) == 0:
+    open(output_file, 'w').close(); sys.exit(0)
 
-# Filter rows where the 9th column is "CDS"
+try:
+    df = pd.read_csv(input_file, sep='\\t', header=None)
+except pd.errors.EmptyDataError:
+    open(output_file, 'w').close(); sys.exit(0)
+
+# Need at least the 6-col BED + 9-col GFF layout (type at 8, attributes at 14).
+if df.shape[1] < 15:
+    open(output_file, 'w').close(); sys.exit(0)
+
 cds_df = df[df[8] == "CDS"]
-
-# Extract unique names following "Name="
 unique_names = set()
 for annotation in cds_df[14]:
-    annotations = annotation.split(';')
-    for annotation in annotations:
-        if annotation.startswith("Name="):
-            name_content = annotation.split('=')[1]
-            unique_names.add(name_content)
+    for field in str(annotation).split(';'):
+        if field.startswith("Name="):
+            unique_names.add(field.split('=', 1)[1])
 
-# Write unique names to the output file
 with open(output_file, 'w') as outfile:
-    for name_content in unique_names:
-        outfile.write(name_content + '\n')
-
-# Print message after extraction is complete
-#print("Extraction complete. Unique names written to", output_file)
+    for name in sorted(unique_names):
+        outfile.write(name + "\\n")
 END_SCRIPT
 
     cat << 'END_SCRIPT' > ProteinIDconversion.py
 import pandas as pd
-import sys
+import sys, os
 
-# Get the input file paths from command line arguments
-infile1 = sys.argv[1]
-infile2 = sys.argv[2]
-output_file = sys.argv[3]
+infile1, infile2, output_file = sys.argv[1], sys.argv[2], sys.argv[3]
 
-# Read the first input file into a DataFrame
-df1 = pd.read_csv(infile1, sep='\t', header=None)
-#print(df1.head)
-# Read the second input file into a DataFrame
-df2 = pd.read_csv(infile2, sep='\t', header=None)
-#print(df2.head)
-# Create a dictionary mapping values from the first column of df1 to the second column of df1
+if not os.path.exists(infile2) or os.path.getsize(infile2) == 0:
+    open(output_file, 'w').close(); sys.exit(0)
+
+df1 = pd.read_csv(infile1, sep='\\t', header=None)
+df2 = pd.read_csv(infile2, sep='\\t', header=None)
 mapping = dict(zip(df1.iloc[:, 0], df1.iloc[:, 1]))
 
-# Open the output file to write the corresponding values
 with open(output_file, 'w') as f:
-    # Iterate over the values in the first column of df2
     for value in df2.iloc[:, 0]:
-        # Check if the value is in the mapping
         if value in mapping:
-            # Write the corresponding value from the second column of df1 to the output file
-            f.write(str(mapping[value]) + '\n')
+            f.write(str(mapping[value]) + "\\n")
 END_SCRIPT
 
-    python ProteinIntersect.py "${intersect_file}" "${intersect_file}.gene" || true
-    python ProteinIDconversion.py "${cds_list}" "${intersect_file}.gene" "${intersect_file}.protein" || true
+    command -v python3 >/dev/null 2>&1 || { echo "ERROR: 'python3' is not in PATH"; exit 1; }
+
+    python3 ProteinIntersect.py "!{intersect_file}" "!{intersect_file}.gene"
+    python3 ProteinIDconversion.py "!{cds_list}" "!{intersect_file}.gene" "!{intersect_file}.protein"
     '''
 }
 
+// ---- Stage 5: GO enrichment (propagated + non-propagated) ------------------
 process stage5 {
     publishDir "results/dist", mode: 'copy'
 
@@ -752,34 +646,20 @@ process stage5 {
     path protein_file
     path all_txt
     path go_txt
+    path obo
 
     output:
     path "*.go.noprop", emit: noprop
-    path "*.go.prop", emit: prop
+    path "*.go.prop",   emit: prop
 
-    script:
+    shell:
     '''
     #!/bin/bash
+    set -eo pipefail
+
     cat << 'END_SCRIPT' > find_enrichment1.py
 #!/usr/bin/env python3
-# -*- coding: UTF-8 -*-
-"""
-python find_enrichment.py study.file population.file gene-association.file
-
-This program returns P-values for functional enrichment in a cluster of study
-genes using Fisher's exact test, and corrected for multiple testing (including
-Bonferroni, Holm, Sidak, and false discovery rate).
-
-About significance cutoff:
---alpha: test-wise alpha; for each GO term, what significance level to apply
-        (most often you don't need to change this other than 0.05 or 0.01)
---pval: experiment-wise alpha; for the entire experiment, what significance
-        level to apply after Bonferroni correction
-"""
-
-__copyright__ = "Copyright (C) 2010-present, H Tang et al. All rights reserved."
-__author__ = "various"
-
+"""GO enrichment wrapper around goatools find_enrichment."""
 import sys
 import os.path as op
 from goatools.cli.find_enrichment import GoeaCliArgs
@@ -787,579 +667,28 @@ from goatools.cli.find_enrichment import GoeaCliFnc
 
 sys.path.insert(0, op.join(op.dirname(__file__), ".."))
 
-
 def main():
-    """Run gene enrichment analysis."""
-    # Load study, population, associations, and GoDag. Run GOEA.
     obj = GoeaCliFnc(GoeaCliArgs().args)
-    # Reduce results to significant results (pval<value)
     results_specified = obj.get_results()
-    # Print results in a flat list
     obj.prt_results(results_specified)
-    # if obj.sections and obj.args.outfile_detail:
-    #     #fout_detail = obj.args.outfile_detail if obj.args.outfile_detail else "goea_details.txt"
-    #     objaart = obj.get_objaart()
-    #     objaart.run("GOEA", results, sys.stdout)
-    #### prt_grouped(results, objgoea, args)
-
 
 if __name__ == "__main__":
     main()
-
-# Copyright (C) 2010-present, H Tang et al. All rights reserved.
-
 END_SCRIPT
 
-    cat << 'END_SCRIPT' > PlotGOHistograms.py
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-import glob
-import io
-
-# Get all .noprop and .prop files — exclude Cumulative files
-noprop_files = [f for f in glob.glob('*.noprop') if not f.startswith('Cumulative')]
-prop_files = [f for f in glob.glob('*.prop') if not f.startswith('Cumulative')]
-
-propdfs = {}
-nopropdfs = {}
-
-# Read .noprop files
-for file in noprop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    nopropdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
-
-# Read .prop files
-for file in prop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    propdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
-
-# Create two subplots: one for 'e' and one for 'p'
-#fig, axs = plt.subplots(2, figsize=(16,10))
-fig, axs = plt.subplots(2)
-# Create a DataFrame for 'e' and 'p' counts
-data_e = []
-data_p = []
-
-# Iterate over all dataframes
-for i, (name, df) in enumerate(nopropdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    quantile_start = float(name.split('_')[1])  # Extract the first quantile value from the filename
-    data_e.append({'Quantile Start': quantile_start, 'Count': e_count, 'File': name})
-    data_p.append({'Quantile Start': quantile_start, 'Count': p_count, 'File': name})
-
-df_e = pd.DataFrame(data_e)
-df_p = pd.DataFrame(data_p)
-
-# Sort the dataframes by 'Quantile Start'
-df_e = df_e.sort_values('Quantile Start')
-df_p = df_p.sort_values('Quantile Start')
-
-# 'e' histogram
-sns.barplot(x='Quantile Start', y='Count', hue='File', data=df_e, ax=axs[0])
-
-# 'p' histogram
-sns.barplot(x='Quantile Start', y='Count', hue='File', data=df_p, ax=axs[1])
-
-# Set labels and titles
-axs[0].set_xlabel('Quantile Start')
-axs[0].set_ylabel('Counts')
-axs[0].set_title('Histogram of e counts')
-#axs[0].set_xticklabels(axs[0].get_xticklabels(), rotation=45, fontsize=8)  # Add rotation here
-axs[0].legend().remove()
-
-axs[1].set_xlabel('Quantile Start')
-axs[1].set_ylabel('Counts')
-axs[1].set_title('Histogram of p counts')
-#axs[1].set_xticklabels(axs[1].get_xticklabels(), rotation=45, fontsize=8)  # And here
-axs[1].legend().remove()
-fig.tight_layout()
-
-# Save the figure
-plt.savefig('histogram_noprop.png')
-
-#plt.show()
-
-# Create two subplots: one for 'e' and one for 'p'
-fig, axs = plt.subplots(2)
-
-# Create a DataFrame for 'e' and 'p' counts
-data_e_prop = []
-data_p_prop = []
-
-# Iterate over all dataframes
-for i, (name, df) in enumerate(propdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    quantile_start = float(name.split('_')[1])  # Extract the first quantile value from the filename
-    data_e_prop.append({'Quantile Start': quantile_start, 'Count': e_count, 'File': name})
-    data_p_prop.append({'Quantile Start': quantile_start, 'Count': p_count, 'File': name})
-
-df_e_prop = pd.DataFrame(data_e_prop)
-df_p_prop = pd.DataFrame(data_p_prop)
-
-# Sort the dataframes by 'Quantile Start'
-df_e_prop = df_e_prop.sort_values('Quantile Start')
-df_p_prop = df_p_prop.sort_values('Quantile Start')
-
-# 'e' histogram
-sns.barplot(x='Quantile Start', y='Count', hue='File', data=df_e_prop, ax=axs[0], palette='cool')
-
-# 'p' histogram
-sns.barplot(x='Quantile Start', y='Count', hue='File', data=df_p_prop, ax=axs[1], palette='cool')
-
-# Set labels and titles
-axs[0].set_xlabel('Quantile Start')
-axs[0].set_ylabel('Counts')
-axs[0].set_title('Histogram of e counts (prop)')
-#axs[0].set_xticklabels(axs[0].get_xticklabels(), rotation=45, fontsize=8)  # Add rotation here
-axs[0].legend().remove()
-
-axs[1].set_xlabel('Quantile Start')
-axs[1].set_ylabel('Counts')
-axs[1].set_title('Histogram of p counts (prop)')
-#axs[1].set_xticklabels(axs[1].get_xticklabels(), rotation=45, fontsize=8)  # And here
-axs[1].legend().remove()
-fig.tight_layout()
-
-# Save the figure
-plt.savefig('histograms_prop.png')
-
-#plt.show()
-
-END_SCRIPT
-
-    cat << 'END_SCRIPT' > GOstatgraphs.py
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-import glob
-import io
-
-# Get all .noprop and .prop files — exclude Cumulative files
-noprop_files = [f for f in glob.glob('*.noprop') if not f.startswith('Cumulative')]
-prop_files = [f for f in glob.glob('*.prop') if not f.startswith('Cumulative')]
-propdfs = {}
-nopropdfs = {}
-
-# Read .noprop files
-for file in noprop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    nopropdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
-
-# Read .prop files
-for file in prop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    propdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
-
-# Create a list for storing data
-data = []
-
-# Function to process dataframes
-def process_dfs(dfs, df_type):
-    for name, df in dfs.items():
-        for enrichment in ['e', 'p']:
-            # Filter dataframe by enrichment type
-            df_filtered = df[df['enrichment'] == enrichment]
-            # Count the occurrences of 'CC', 'MF', and 'BP' in the 'NS' column
-            counts = df_filtered['NS'].value_counts(normalize=True)
-            for ns in ['CC', 'MF', 'BP']:
-                if ns in counts:
-                    # Extract the first part of the filename as quantile_start
-                    quantile_start = float(name.split('_')[1])
-                    data.append({'Quantile Start': quantile_start, 'NS': ns, 'Relative Abundance %': counts[ns], 'Type': df_type, 'Enrichment': enrichment})
-
-# Process nopropdfs and propdfs
-process_dfs(nopropdfs, 'noprop')
-process_dfs(propdfs, 'prop')
-
-# Convert the list to a DataFrame
-df = pd.DataFrame(data)
-
-# Create separate plots for 'noprop' and 'prop', and for 'e' and 'p'
-for df_type in ['noprop', 'prop']:
-    for enrichment in ['e', 'p']:
-        plt.figure(figsize=(10, 6))
-        sns.barplot(x='Quantile Start', y='Relative Abundance %', hue='NS', data=df[(df['Type'] == df_type) & (df['Enrichment'] == enrichment)], palette='Set2', ci=None)
-        plt.title(f'Relative Abundances of CC, MF, and BP ({df_type}, {enrichment})')
-        plt.savefig(f'Relative Abundances of CC, MF, and BP ({df_type}, {enrichment}).png')
-        #plt.show()
-END_SCRIPT
-
-    cat << 'END_SCRIPT' > PlotGOHistogramsCumulative.py
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-import glob
-import io
-
-ctnpdfs = {}
-ctpdfs = {}
-cbnpdfs = {}
-cbpdfs = {}
-
-
-cumulative_top_noprop_files = glob.glob('Cumulative_0_*.noprop')
-cumulative_top_prop_files = glob.glob('Cumulative_0_*.prop')
-cumulative_bottom_noprop_files = glob.glob('*_inf.intersect.protein.go.noprop')
-cumulative_bottom_prop_files = glob.glob('*_inf.intersect.protein.go.prop')
-
-
-
-for file in cumulative_top_noprop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    ctnpdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
-
-for file in cumulative_top_prop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    ctpdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
-
-for file in cumulative_bottom_noprop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    cbnpdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
-
-for file in cumulative_bottom_prop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    cbpdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
-
-
-
-# Create two subplots for cumulative top noprop files
-fig, axs = plt.subplots(2, figsize=(16, 10))
-
-# Create a DataFrame for 'e' and 'p' counts for cumulative top noprop files
-data_e_ctn = []
-data_p_ctn = []
-
-for i, (name, df) in enumerate(ctnpdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    #quantile_start = float(name.split('_')[2])
-    quantile_start = float(name.split('_')[-1].split('.')[0] + '.' + name.split('_')[-1].split('.')[1])
-    quantile_start_percentage = int(quantile_start * 100)
-    data_e_ctn.append({'Cumulative Start': quantile_start_percentage, 'Count': e_count, 'File': name})
-    data_p_ctn.append({'Cumulative Start': quantile_start_percentage, 'Count': p_count, 'File': name})
-
-df_e_ctn = pd.DataFrame(data_e_ctn)
-df_p_ctn = pd.DataFrame(data_p_ctn)
-
-df_e_ctn = df_e_ctn.sort_values('Cumulative Start')
-df_p_ctn = df_p_ctn.sort_values('Cumulative Start')
-
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_e_ctn, ax=axs[0])
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_p_ctn, ax=axs[1])
-
-axs[0].set_xlabel('Cumulative fraction of genome assessed % -- Counting from bottom')
-axs[0].set_ylabel('Counts')
-axs[0].set_title('Histogram of e counts (Cumulative count to Top - No Prop)')
-axs[0].legend().remove()
-
-axs[1].set_xlabel('Cumulative fraction of genome assessed % -- Counting from bottom')
-axs[1].set_ylabel('Counts')
-axs[1].set_title('Histogram of p counts (Cumulative count to Top - No Prop)')
-axs[1].legend().remove()
-
-fig.tight_layout()
-plt.savefig('histogram_cumulative_top_noprop.png')
-
-# Create two subplots for cumulative top prop files
-fig, axs = plt.subplots(2, figsize=(16, 10))
-
-# Create a DataFrame for 'e' and 'p' counts for cumulative top prop files
-data_e_ctp = []
-data_p_ctp = []
-
-for i, (name, df) in enumerate(ctpdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    # quantile_start = float(name.split('_')[2]) 
-    quantile_start = float(name.split('_')[-1].split('.')[0] + '.' + name.split('_')[-1].split('.')[1])
-    quantile_start_percentage = int(quantile_start * 100)
-    data_e_ctp.append({'Cumulative Start': quantile_start_percentage, 'Count': e_count, 'File': name})
-    data_p_ctp.append({'Cumulative Start': quantile_start_percentage, 'Count': p_count, 'File': name})
-
-
-df_e_ctp = pd.DataFrame(data_e_ctp)
-df_p_ctp = pd.DataFrame(data_p_ctp)
-
-df_e_ctp = df_e_ctp.sort_values('Cumulative Start')
-df_p_ctp = df_p_ctp.sort_values('Cumulative Start')
-
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_e_ctp, ax=axs[0], palette='cool')
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_p_ctp, ax=axs[1], palette='cool')
-
-axs[0].set_xlabel('Cumulative fraction of genome assessed % -- Counting from bottom')
-axs[0].set_ylabel('Counts')
-axs[0].set_title('Histogram of e counts (Cumulative count to Top - Prop)')
-axs[0].legend().remove()
-
-axs[1].set_xlabel('Cumulative fraction of genome assessed % -- Counting from bottom')
-axs[1].set_ylabel('Counts')
-axs[1].set_title('Histogram of p counts (Cumulative count to Top - Prop)')
-axs[1].legend().remove()
-
-fig.tight_layout()
-plt.savefig('histogram_cumulative_top_prop.png')
-
-#plt.show()
-# Create two subplots for cumulative bottom noprop files
-fig, axs = plt.subplots(2, figsize=(16, 10))
-
-# Create a DataFrame for 'e' and 'p' counts for cumulative bottom noprop files
-data_e_cbn = []
-data_p_cbn = []
-
-for i, (name, df) in enumerate(cbnpdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    quantile_start = float(name.split('_')[1])
-    quantile_start_percentage = int(quantile_start * 100)
-    data_e_cbn.append({'Cumulative Start': quantile_start_percentage, 'Count': e_count, 'File': name})
-    data_p_cbn.append({'Cumulative Start': quantile_start_percentage, 'Count': p_count, 'File': name})
-
-df_e_cbn = pd.DataFrame(data_e_cbn)
-df_p_cbn = pd.DataFrame(data_p_cbn)
-
-df_e_cbn = df_e_cbn.sort_values('Cumulative Start')
-df_p_cbn = df_p_cbn.sort_values('Cumulative Start')
-
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_e_cbn, ax=axs[0])
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_p_cbn, ax=axs[1])
-
-axs[0].set_xlabel('Cumulative fraction of genome assessed % -- Counting from top')
-axs[0].set_ylabel('Counts')
-axs[0].set_title('Histogram of e counts (Cumulative count to Bottom - No Prop)')
-axs[0].legend().remove()
-
-axs[1].set_xlabel('Cumulative fraction of genome assessed % -- Counting from top')
-axs[1].set_ylabel('Counts')
-axs[1].set_title('Histogram of p counts (Cumulative count to Bottom - No Prop)')
-axs[1].legend().remove()
-
-fig.tight_layout()
-plt.savefig('histogram_cumulative_bottom_noprop.png')
-
-# Create two subplots for cumulative bottom prop files
-fig, axs = plt.subplots(2, figsize=(16, 10))
-
-# Create a DataFrame for 'e' and 'p' counts for cumulative bottom prop files
-data_e_cbp = []
-data_p_cbp = []
-
-for i, (name, df) in enumerate(cbpdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    quantile_start = float(name.split('_', 2)[1])
-    quantile_start_percentage = int(quantile_start * 100)
-    data_e_cbp.append({'Cumulative Start': quantile_start_percentage, 'Count': e_count, 'File': name})
-    data_p_cbp.append({'Cumulative Start': quantile_start_percentage, 'Count': p_count, 'File': name})
-
-df_e_cbp = pd.DataFrame(data_e_cbp)
-df_p_cbp = pd.DataFrame(data_p_cbp)
-
-df_e_cbp = df_e_cbp.sort_values('Cumulative Start')
-df_p_cbp = df_p_cbp.sort_values('Cumulative Start')
-
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_e_cbp, ax=axs[0], palette='cool')
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_p_cbp, ax=axs[1], palette='cool')
-
-axs[0].set_xlabel('Cumulative fraction of genome assessed % -- Counting from top')
-axs[0].set_ylabel('Counts')
-axs[0].set_title('Histogram of e counts (Cumulative count to Bottom - Prop)')
-axs[0].legend().remove()
-
-axs[1].set_xlabel('Cumulative fraction of genome assessed % -- Counting from top')
-axs[1].set_ylabel('Counts')
-axs[1].set_title('Histogram of p counts (Cumulative count to Bottom - Prop)')
-axs[1].legend().remove()
-
-fig.tight_layout()
-plt.savefig('histogram_cumulative_bottom_prop.png')
-
-#plt.show()
-
-fig, axs = plt.subplots(2, figsize=(16, 10))
-
-# Create a DataFrame for combined 'e' and 'p' counts for cumulative top noprop files
-data_combined_ctn = []
-for i, (name, df) in enumerate(ctnpdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    combined_count = e_count + p_count
-    quantile_start = float(name.split('_')[-1].split('.')[0] + '.' + name.split('_')[-1].split('.')[1])
-    quantile_start_percentage = int(quantile_start * 100)
-    data_combined_ctn.append({'Cumulative Start': quantile_start_percentage, 'Count': combined_count, 'File': name})
-df_combined_ctn = pd.DataFrame(data_combined_ctn)
-df_combined_ctn = df_combined_ctn.sort_values('Cumulative Start')
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_combined_ctn, ax=axs[0])
-axs[0].set_xlabel('Cumulative fraction of genome assessed % -- Counting from bottom')
-axs[0].set_ylabel('Counts')
-axs[0].set_title('Histogram of combined e and p counts (Cumulative count to Top - No Prop)')
-axs[0].legend().remove()
-
-# Create a DataFrame for combined 'e' and 'p' counts for cumulative top prop files
-data_combined_ctp = []
-for i, (name, df) in enumerate(ctpdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    combined_count = e_count + p_count
-    quantile_start = float(name.split('_')[-1].split('.')[0] + '.' + name.split('_')[-1].split('.')[1])
-    quantile_start_percentage = int(quantile_start * 100)
-    data_combined_ctp.append({'Cumulative Start': quantile_start_percentage, 'Count': combined_count, 'File': name})
-df_combined_ctp = pd.DataFrame(data_combined_ctp)
-df_combined_ctp = df_combined_ctp.sort_values('Cumulative Start')
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_combined_ctp, ax=axs[1], palette='cool')
-axs[1].set_xlabel('Cumulative fraction of genome assessed % -- Counting from bottom')
-axs[1].set_ylabel('Counts')
-axs[1].set_title('Histogram of combined e and p counts (Cumulative count to Top - Prop)')
-axs[1].legend().remove()
-
-fig.tight_layout()
-plt.savefig('histogram_cumulative_combined_top.png')
-
-#plt.show()
-
-fig, axs = plt.subplots(2, figsize=(16, 10))
-# Create a DataFrame for combined 'e' and 'p' counts for cumulative bottom noprop files
-data_combined_cbn = []
-for i, (name, df) in enumerate(cbnpdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    combined_count = e_count + p_count
-    quantile_start = float(name.split('_')[1])
-    quantile_start_percentage = int(quantile_start * 100)
-    data_combined_cbn.append({'Cumulative Start': quantile_start_percentage, 'Count': combined_count, 'File': name})
-df_combined_cbn = pd.DataFrame(data_combined_cbn)
-df_combined_cbn = df_combined_cbn.sort_values('Cumulative Start')
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_combined_cbn, ax=axs[0])
-axs[0].set_xlabel('Cumulative fraction of genome assessed % -- Counting from top')
-axs[0].set_ylabel('Counts')
-axs[0].set_title('Histogram of combined e and p counts (Cumulative count to Bottom - No Prop)')
-axs[0].legend().remove()
-
-# Create a DataFrame for combined 'e' and 'p' counts for cumulative bottom prop files
-data_combined_cbp = []
-for i, (name, df) in enumerate(cbpdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    combined_count = e_count + p_count
-    quantile_start = float(name.split('_', 2)[1])
-    quantile_start_percentage = int(quantile_start * 100)
-    data_combined_cbp.append({'Cumulative Start': quantile_start_percentage, 'Count': combined_count, 'File': name})
-df_combined_cbp = pd.DataFrame(data_combined_cbp)
-df_combined_cbp = df_combined_cbp.sort_values('Cumulative Start')
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_combined_cbp, ax=axs[1], palette='cool')
-axs[1].set_xlabel('Cumulative fraction of genome assessed % -- Counting from top')
-axs[1].set_ylabel('Counts')
-axs[1].set_title('Histogram of combined e and p counts (Cumulative count to Bottom - Prop)')
-axs[1].legend().remove()
-
-fig.tight_layout()
-plt.savefig('histogram_cumulative_combined_bottom.png')
-END_SCRIPT
-
-    cat << 'END_SCRIPT' > GOstatgraphsCumulative.py
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-import glob
-import io
-
-# Get all .noprop and .prop files
-noprop_files = glob.glob('*.noprop')
-prop_files = glob.glob('*.prop')
-propdfs = {}
-nopropdfs = {}
-
-# Read .noprop files
-for file in noprop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    nopropdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
-
-# Read .prop files
-for file in prop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    propdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
-
-# Create a list for storing data
-data = []
-
-# Function to process dataframes
-def process_dfs(dfs, df_type):
-    for name, df in dfs.items():
-        for enrichment in ['e', 'p']:
-            # Filter dataframe by enrichment type
-            df_filtered = df[df['enrichment'] == enrichment]
-            # Count the occurrences of 'CC', 'MF', and 'BP' in the 'NS' column
-            counts = df_filtered['NS'].value_counts(normalize=True)
-            for ns in ['CC', 'MF', 'BP']:
-                if ns in counts:
-                    # Extract the first part of the filename as quantile_start
-                    quantile_start = float(name.split('_')[1])
-                    data.append({'Quantile Start': quantile_start, 'NS': ns, 'Relative Abundance %': counts[ns], 'Type': df_type, 'Enrichment': enrichment})
-
-# Process nopropdfs and propdfs
-process_dfs(nopropdfs, 'noprop')
-process_dfs(propdfs, 'prop')
-
-# Convert the list to a DataFrame
-df = pd.DataFrame(data)
-
-# Create separate plots for 'noprop' and 'prop', and for 'e' and 'p'
-for df_type in ['noprop', 'prop']:
-    for enrichment in ['e', 'p']:
-        plt.figure(figsize=(10, 6))
-        sns.barplot(x='Quantile Start', y='Relative Abundance %', hue='NS', data=df[(df['Type'] == df_type) & (df['Enrichment'] == enrichment)], palette='Set2', errorbar=None)
-        plt.title(f'Relative Abundances of CC, MF, and BP ({df_type}, {enrichment})')
-        plt.savefig(f'Relative Abundances of CC, MF, and BP ({df_type}, {enrichment}).png')
-        #plt.show()
-END_SCRIPT
-
-    if [ -s "${protein_file}" ]; then
-        python find_enrichment1.py "${protein_file}" "${all_txt}" "${go_txt}" --pval 0.05 --no_propagate_counts > "${protein_file}.go.noprop"
-        python find_enrichment1.py "${protein_file}" "${all_txt}" "${go_txt}" --pval 0.05 > "${protein_file}.go.prop"
+    command -v python3 >/dev/null 2>&1 || { echo "ERROR: 'python3' is not in PATH"; exit 1; }
+
+    if [ -s "!{protein_file}" ]; then
+        python3 find_enrichment1.py "!{protein_file}" "!{all_txt}" "!{go_txt}" --obo "!{obo}" --pval 0.05 --no_propagate_counts > "!{protein_file}.go.noprop"
+        python3 find_enrichment1.py "!{protein_file}" "!{all_txt}" "!{go_txt}" --obo "!{obo}" --pval 0.05                     > "!{protein_file}.go.prop"
     else
-        echo "# No proteins found — empty enrichment" > "${protein_file}.go.noprop"
-        echo "# No proteins found — empty enrichment" > "${protein_file}.go.prop"
+        echo "# No proteins found - empty enrichment" > "!{protein_file}.go.noprop"
+        echo "# No proteins found - empty enrichment" > "!{protein_file}.go.prop"
     fi
     '''
 }
 
+// ---- Stage 6: aggregate GO results into histograms -------------------------
 process stage6 {
     publishDir "results/dist", mode: 'copy'
 
@@ -1368,449 +697,658 @@ process stage6 {
     path prop_files
 
     output:
-    path "GO_results/*", emit: go_plots, optional: true
+    path "GO_results/*",           emit: go_plots,         optional: true
     path "CumulativeGO_results/*", emit: cumulative_plots, optional: true
 
-    script:
+    shell:
     '''
     #!/bin/bash
+    set -eo pipefail
+
     cat << 'END_SCRIPT' > PlotGOHistograms.py
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
-import numpy as np
-import glob
-import io
+import glob, io
 
-# Get all .noprop and .prop files — exclude Cumulative files
-noprop_files = [f for f in glob.glob('*.noprop') if not f.startswith('Cumulative')]
-prop_files = [f for f in glob.glob('*.prop') if not f.startswith('Cumulative')]
+def load(files):
+    out = {}
+    for file in files:
+        with open(file) as f:
+            lines = f.readlines()
+        start = next((i for i, l in enumerate(lines) if l.startswith('GO\\tNS\\t')), None)
+        if start is None:
+            continue
+        out[file] = pd.read_csv(io.StringIO(''.join(lines[start:])), sep='\\t')
+    return out
 
-propdfs = {}
-nopropdfs = {}
-
-# Read .noprop files
-for file in noprop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    nopropdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
-
-# Read .prop files
-for file in prop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    propdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
+nopropdfs = load([f for f in glob.glob('*.noprop') if not f.startswith('Cumulative')])
+propdfs   = load([f for f in glob.glob('*.prop')   if not f.startswith('Cumulative')])
 
 if not nopropdfs and not propdfs:
-    print("No enrichment result files found — skipping histogram plots")
-    exit(0)
+    print("No enrichment result files found - skipping histogram plots"); raise SystemExit
 
-fig, axs = plt.subplots(2)
-data_e = []
-data_p = []
+def counts(dfs):
+    de, dp = [], []
+    for name, df in dfs.items():
+        try:
+            q = float(name.split('_')[1])
+        except (IndexError, ValueError):
+            continue
+        de.append({'Quantile Start': q, 'Count': df[df['enrichment'] == 'e'].shape[0]})
+        dp.append({'Quantile Start': q, 'Count': df[df['enrichment'] == 'p'].shape[0]})
+    return pd.DataFrame(de).sort_values('Quantile Start'), pd.DataFrame(dp).sort_values('Quantile Start')
 
-for i, (name, df) in enumerate(nopropdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    quantile_start = float(name.split('_')[1])
-    data_e.append({'Quantile Start': quantile_start, 'Count': e_count, 'File': name})
-    data_p.append({'Quantile Start': quantile_start, 'Count': p_count, 'File': name})
-
-df_e = pd.DataFrame(data_e)
-df_p = pd.DataFrame(data_p)
-df_e = df_e.sort_values('Quantile Start')
-df_p = df_p.sort_values('Quantile Start')
-
-sns.barplot(x='Quantile Start', y='Count', hue='File', data=df_e, ax=axs[0])
-sns.barplot(x='Quantile Start', y='Count', hue='File', data=df_p, ax=axs[1])
-
-axs[0].set_xlabel('Quantile Start')
-axs[0].set_ylabel('Counts')
-axs[0].set_title('Histogram of e counts')
-axs[0].legend().remove()
-
-axs[1].set_xlabel('Quantile Start')
-axs[1].set_ylabel('Counts')
-axs[1].set_title('Histogram of p counts')
-axs[1].legend().remove()
-fig.tight_layout()
-plt.savefig('histogram_noprop.png')
-
-fig, axs = plt.subplots(2)
-data_e_prop = []
-data_p_prop = []
-
-for i, (name, df) in enumerate(propdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    quantile_start = float(name.split('_')[1])
-    data_e_prop.append({'Quantile Start': quantile_start, 'Count': e_count, 'File': name})
-    data_p_prop.append({'Quantile Start': quantile_start, 'Count': p_count, 'File': name})
-
-df_e_prop = pd.DataFrame(data_e_prop)
-df_p_prop = pd.DataFrame(data_p_prop)
-df_e_prop = df_e_prop.sort_values('Quantile Start')
-df_p_prop = df_p_prop.sort_values('Quantile Start')
-
-sns.barplot(x='Quantile Start', y='Count', hue='File', data=df_e_prop, ax=axs[0], palette='cool')
-sns.barplot(x='Quantile Start', y='Count', hue='File', data=df_p_prop, ax=axs[1], palette='cool')
-
-axs[0].set_xlabel('Quantile Start')
-axs[0].set_ylabel('Counts')
-axs[0].set_title('Histogram of e counts (prop)')
-axs[0].legend().remove()
-
-axs[1].set_xlabel('Quantile Start')
-axs[1].set_ylabel('Counts')
-axs[1].set_title('Histogram of p counts (prop)')
-axs[1].legend().remove()
-fig.tight_layout()
-plt.savefig('histograms_prop.png')
+for dfs, out, pal in [(nopropdfs, 'histogram_noprop.png', None),
+                      (propdfs, 'histograms_prop.png', 'cool')]:
+    if not dfs:
+        continue
+    de, dp = counts(dfs)
+    fig, axs = plt.subplots(2)
+    sns.barplot(x='Quantile Start', y='Count', data=de, ax=axs[0], color='steelblue')
+    sns.barplot(x='Quantile Start', y='Count', data=dp, ax=axs[1], color='indianred')
+    axs[0].set_title('e counts'); axs[1].set_title('p counts')
+    fig.tight_layout(); plt.savefig(out); plt.close(fig)
 END_SCRIPT
 
     cat << 'END_SCRIPT' > GOstatgraphs.py
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
-import numpy as np
-import glob
-import io
+import glob, io
 
-# Get all .noprop and .prop files — exclude Cumulative files
-noprop_files = [f for f in glob.glob('*.noprop') if not f.startswith('Cumulative')]
-prop_files = [f for f in glob.glob('*.prop') if not f.startswith('Cumulative')]
-propdfs = {}
-nopropdfs = {}
+def load(files):
+    out = {}
+    for file in files:
+        with open(file) as f:
+            lines = f.readlines()
+        start = next((i for i, l in enumerate(lines) if l.startswith('GO\\tNS\\t')), None)
+        if start is None:
+            continue
+        out[file] = pd.read_csv(io.StringIO(''.join(lines[start:])), sep='\\t')
+    return out
 
-for file in noprop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    nopropdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
-
-for file in prop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    propdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
+nopropdfs = load([f for f in glob.glob('*.noprop') if not f.startswith('Cumulative')])
+propdfs   = load([f for f in glob.glob('*.prop')   if not f.startswith('Cumulative')])
 
 if not nopropdfs and not propdfs:
-    print("No enrichment result files found — skipping NS abundance plots")
-    exit(0)
+    print("No enrichment result files found - skipping NS abundance plots"); raise SystemExit
 
 data = []
-
-def process_dfs(dfs, df_type):
+def process(dfs, dtype):
     for name, df in dfs.items():
-        for enrichment in ['e', 'p']:
-            df_filtered = df[df['enrichment'] == enrichment]
-            counts = df_filtered['NS'].value_counts(normalize=True)
+        try:
+            q = float(name.split('_')[1])
+        except (IndexError, ValueError):
+            continue
+        for enr in ['e', 'p']:
+            counts = df[df['enrichment'] == enr]['NS'].value_counts(normalize=True)
             for ns in ['CC', 'MF', 'BP']:
                 if ns in counts:
-                    quantile_start = float(name.split('_')[1])
-                    data.append({'Quantile Start': quantile_start, 'NS': ns, 'Relative Abundance %': counts[ns], 'Type': df_type, 'Enrichment': enrichment})
+                    data.append({'Quantile Start': q, 'NS': ns,
+                                 'Relative Abundance %': counts[ns],
+                                 'Type': dtype, 'Enrichment': enr})
 
-process_dfs(nopropdfs, 'noprop')
-process_dfs(propdfs, 'prop')
-
+process(nopropdfs, 'noprop'); process(propdfs, 'prop')
 df = pd.DataFrame(data)
-
-for df_type in ['noprop', 'prop']:
-    for enrichment in ['e', 'p']:
+for dtype in ['noprop', 'prop']:
+    for enr in ['e', 'p']:
+        sub = df[(df['Type'] == dtype) & (df['Enrichment'] == enr)]
+        if sub.empty:
+            continue
         plt.figure(figsize=(10, 6))
-        sns.barplot(x='Quantile Start', y='Relative Abundance %', hue='NS', data=df[(df['Type'] == df_type) & (df['Enrichment'] == enrichment)], palette='Set2', errorbar=None)
-        plt.title(f'Relative Abundances of CC, MF, and BP ({df_type}, {enrichment})')
-        plt.savefig(f'Relative Abundances of CC, MF, and BP ({df_type}, {enrichment}).png')
+        sns.barplot(x='Quantile Start', y='Relative Abundance %', hue='NS',
+                    data=sub, palette='Set2', errorbar=None)
+        plt.title(f'Relative Abundances CC/MF/BP ({dtype}, {enr})')
+        plt.savefig(f'RelAbundance_{dtype}_{enr}.png'); plt.close()
 END_SCRIPT
 
     cat << 'END_SCRIPT' > PlotGOHistogramsCumulative.py
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
-import numpy as np
-import glob
-import io
+import glob, io
 
-ctnpdfs = {}
-ctpdfs = {}
-cbnpdfs = {}
-cbpdfs = {}
+def load(files):
+    out = {}
+    for file in files:
+        with open(file) as f:
+            lines = f.readlines()
+        start = next((i for i, l in enumerate(lines) if l.startswith('GO\\tNS\\t')), None)
+        if start is None:
+            continue
+        out[file] = pd.read_csv(io.StringIO(''.join(lines[start:])), sep='\\t')
+    return out
 
-cumulative_top_noprop_files = glob.glob('Cumulative_0_*.noprop')
-cumulative_top_prop_files = glob.glob('Cumulative_0_*.prop')
-cumulative_bottom_noprop_files = glob.glob('*_inf.intersect.protein.go.noprop')
-cumulative_bottom_prop_files = glob.glob('*_inf.intersect.protein.go.prop')
+def pct_from_tail(name):
+    tok = name.split('_')[-1].split('.')
+    return int(float(tok[0] + '.' + tok[1]) * 100)
 
-for file in cumulative_top_noprop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    ctnpdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
+def pct_from_field1(name):
+    return int(float(name.split('_')[1]) * 100)
 
-for file in cumulative_top_prop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    ctpdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
+ctn = load(glob.glob('Cumulative_0_*.noprop'))
+ctp = load(glob.glob('Cumulative_0_*.prop'))
+cbn = load(glob.glob('*_inf.intersect.protein.go.noprop'))
+cbp = load(glob.glob('*_inf.intersect.protein.go.prop'))
 
-for file in cumulative_bottom_noprop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    cbnpdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
+if not any([ctn, ctp, cbn, cbp]):
+    print("No cumulative enrichment files - skipping cumulative plots"); raise SystemExit
 
-for file in cumulative_bottom_prop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    cbpdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
+def plot(dfs, keyfn, out, pal):
+    if not dfs:
+        return
+    de, dp = [], []
+    for name, df in dfs.items():
+        try:
+            k = keyfn(name)
+        except (IndexError, ValueError):
+            continue
+        de.append({'Cumulative Start': k, 'Count': df[df['enrichment'] == 'e'].shape[0]})
+        dp.append({'Cumulative Start': k, 'Count': df[df['enrichment'] == 'p'].shape[0]})
+    de = pd.DataFrame(de).sort_values('Cumulative Start')
+    dp = pd.DataFrame(dp).sort_values('Cumulative Start')
+    fig, axs = plt.subplots(2, figsize=(16, 10))
+    sns.barplot(x='Cumulative Start', y='Count', data=de, ax=axs[0], color='steelblue')
+    sns.barplot(x='Cumulative Start', y='Count', data=dp, ax=axs[1], color='indianred')
+    fig.tight_layout(); plt.savefig(out); plt.close(fig)
 
-if not ctnpdfs and not cbnpdfs:
-    print("No cumulative enrichment files found — skipping cumulative histogram plots")
-    exit(0)
-
-fig, axs = plt.subplots(2, figsize=(16, 10))
-data_e_ctn = []
-data_p_ctn = []
-
-for i, (name, df) in enumerate(ctnpdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    quantile_start = float(name.split('_')[-1].split('.')[0] + '.' + name.split('_')[-1].split('.')[1])
-    quantile_start_percentage = int(quantile_start * 100)
-    data_e_ctn.append({'Cumulative Start': quantile_start_percentage, 'Count': e_count, 'File': name})
-    data_p_ctn.append({'Cumulative Start': quantile_start_percentage, 'Count': p_count, 'File': name})
-
-df_e_ctn = pd.DataFrame(data_e_ctn)
-df_p_ctn = pd.DataFrame(data_p_ctn)
-df_e_ctn = df_e_ctn.sort_values('Cumulative Start')
-df_p_ctn = df_p_ctn.sort_values('Cumulative Start')
-
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_e_ctn, ax=axs[0])
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_p_ctn, ax=axs[1])
-
-axs[0].set_xlabel('Cumulative fraction of genome assessed % -- Counting from bottom')
-axs[0].set_ylabel('Counts')
-axs[0].set_title('Histogram of e counts (Cumulative count to Top - No Prop)')
-axs[0].legend().remove()
-
-axs[1].set_xlabel('Cumulative fraction of genome assessed % -- Counting from bottom')
-axs[1].set_ylabel('Counts')
-axs[1].set_title('Histogram of p counts (Cumulative count to Top - No Prop)')
-axs[1].legend().remove()
-
-fig.tight_layout()
-plt.savefig('histogram_cumulative_top_noprop.png')
-
-fig, axs = plt.subplots(2, figsize=(16, 10))
-data_e_ctp = []
-data_p_ctp = []
-
-for i, (name, df) in enumerate(ctpdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    quantile_start = float(name.split('_')[-1].split('.')[0] + '.' + name.split('_')[-1].split('.')[1])
-    quantile_start_percentage = int(quantile_start * 100)
-    data_e_ctp.append({'Cumulative Start': quantile_start_percentage, 'Count': e_count, 'File': name})
-    data_p_ctp.append({'Cumulative Start': quantile_start_percentage, 'Count': p_count, 'File': name})
-
-df_e_ctp = pd.DataFrame(data_e_ctp)
-df_p_ctp = pd.DataFrame(data_p_ctp)
-df_e_ctp = df_e_ctp.sort_values('Cumulative Start')
-df_p_ctp = df_p_ctp.sort_values('Cumulative Start')
-
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_e_ctp, ax=axs[0], palette='cool')
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_p_ctp, ax=axs[1], palette='cool')
-
-axs[0].set_xlabel('Cumulative fraction of genome assessed % -- Counting from bottom')
-axs[0].set_ylabel('Counts')
-axs[0].set_title('Histogram of e counts (Cumulative count to Top - Prop)')
-axs[0].legend().remove()
-
-axs[1].set_xlabel('Cumulative fraction of genome assessed % -- Counting from bottom')
-axs[1].set_ylabel('Counts')
-axs[1].set_title('Histogram of p counts (Cumulative count to Top - Prop)')
-axs[1].legend().remove()
-
-fig.tight_layout()
-plt.savefig('histogram_cumulative_top_prop.png')
-
-fig, axs = plt.subplots(2, figsize=(16, 10))
-data_e_cbn = []
-data_p_cbn = []
-
-for i, (name, df) in enumerate(cbnpdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    quantile_start = float(name.split('_')[1])
-    quantile_start_percentage = int(quantile_start * 100)
-    data_e_cbn.append({'Cumulative Start': quantile_start_percentage, 'Count': e_count, 'File': name})
-    data_p_cbn.append({'Cumulative Start': quantile_start_percentage, 'Count': p_count, 'File': name})
-
-df_e_cbn = pd.DataFrame(data_e_cbn)
-df_p_cbn = pd.DataFrame(data_p_cbn)
-df_e_cbn = df_e_cbn.sort_values('Cumulative Start')
-df_p_cbn = df_p_cbn.sort_values('Cumulative Start')
-
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_e_cbn, ax=axs[0])
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_p_cbn, ax=axs[1])
-
-axs[0].set_xlabel('Cumulative fraction of genome assessed % -- Counting from top')
-axs[0].set_ylabel('Counts')
-axs[0].set_title('Histogram of e counts (Cumulative count to Bottom - No Prop)')
-axs[0].legend().remove()
-
-axs[1].set_xlabel('Cumulative fraction of genome assessed % -- Counting from top')
-axs[1].set_ylabel('Counts')
-axs[1].set_title('Histogram of p counts (Cumulative count to Bottom - No Prop)')
-axs[1].legend().remove()
-
-fig.tight_layout()
-plt.savefig('histogram_cumulative_bottom_noprop.png')
-
-fig, axs = plt.subplots(2, figsize=(16, 10))
-data_e_cbp = []
-data_p_cbp = []
-
-for i, (name, df) in enumerate(cbpdfs.items()):
-    e_count = df[df['enrichment'] == 'e'].shape[0]
-    p_count = df[df['enrichment'] == 'p'].shape[0]
-    quantile_start = float(name.split('_', 2)[1])
-    quantile_start_percentage = int(quantile_start * 100)
-    data_e_cbp.append({'Cumulative Start': quantile_start_percentage, 'Count': e_count, 'File': name})
-    data_p_cbp.append({'Cumulative Start': quantile_start_percentage, 'Count': p_count, 'File': name})
-
-df_e_cbp = pd.DataFrame(data_e_cbp)
-df_p_cbp = pd.DataFrame(data_p_cbp)
-df_e_cbp = df_e_cbp.sort_values('Cumulative Start')
-df_p_cbp = df_p_cbp.sort_values('Cumulative Start')
-
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_e_cbp, ax=axs[0], palette='cool')
-sns.barplot(x='Cumulative Start', y='Count', hue='File', data=df_p_cbp, ax=axs[1], palette='cool')
-
-axs[0].set_xlabel('Cumulative fraction of genome assessed % -- Counting from top')
-axs[0].set_ylabel('Counts')
-axs[0].set_title('Histogram of e counts (Cumulative count to Bottom - Prop)')
-axs[0].legend().remove()
-
-axs[1].set_xlabel('Cumulative fraction of genome assessed % -- Counting from top')
-axs[1].set_ylabel('Counts')
-axs[1].set_title('Histogram of p counts (Cumulative count to Bottom - Prop)')
-axs[1].legend().remove()
-
-fig.tight_layout()
-plt.savefig('histogram_cumulative_bottom_prop.png')
+plot(ctn, pct_from_tail, 'histogram_cumulative_top_noprop.png', None)
+plot(ctp, pct_from_tail, 'histogram_cumulative_top_prop.png', 'cool')
+plot(cbn, pct_from_field1, 'histogram_cumulative_bottom_noprop.png', None)
+plot(cbp, pct_from_field1, 'histogram_cumulative_bottom_prop.png', 'cool')
 END_SCRIPT
 
     cat << 'END_SCRIPT' > GOstatgraphsCumulative.py
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
-import numpy as np
-import glob
-import io
+import glob, io
 
-# Get all .noprop and .prop files in the cumulative results directory
-noprop_files = glob.glob('*.noprop')
-prop_files = glob.glob('*.prop')
-propdfs = {}
-nopropdfs = {}
+def load(files):
+    out = {}
+    for file in files:
+        with open(file) as f:
+            lines = f.readlines()
+        start = next((i for i, l in enumerate(lines) if l.startswith('GO\\tNS\\t')), None)
+        if start is None:
+            continue
+        out[file] = pd.read_csv(io.StringIO(''.join(lines[start:])), sep='\\t')
+    return out
 
-for file in noprop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    nopropdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
-
-for file in prop_files:
-    with open(file, 'r') as f:
-        lines = f.readlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith('GO\tNS\t'))
-    table = ''.join(lines[start:])
-    propdfs[file] = pd.read_csv(io.StringIO(table), sep='\t')
+nopropdfs = load(glob.glob('*.noprop'))
+propdfs   = load(glob.glob('*.prop'))
 
 if not nopropdfs and not propdfs:
-    print("No cumulative enrichment files found — skipping NS abundance plots")
-    exit(0)
+    print("No cumulative enrichment files - skipping NS abundance plots"); raise SystemExit
 
 data = []
-
-def process_dfs(dfs, df_type):
+def process(dfs, dtype):
     for name, df in dfs.items():
-        for enrichment in ['e', 'p']:
-            df_filtered = df[df['enrichment'] == enrichment]
-            counts = df_filtered['NS'].value_counts(normalize=True)
+        try:
+            q = float(name.split('_')[1])
+        except (IndexError, ValueError):
+            continue
+        for enr in ['e', 'p']:
+            counts = df[df['enrichment'] == enr]['NS'].value_counts(normalize=True)
             for ns in ['CC', 'MF', 'BP']:
                 if ns in counts:
-                    quantile_start = float(name.split('_')[1])
-                    data.append({'Quantile Start': quantile_start, 'NS': ns, 'Relative Abundance %': counts[ns], 'Type': df_type, 'Enrichment': enrichment})
+                    data.append({'Quantile Start': q, 'NS': ns,
+                                 'Relative Abundance %': counts[ns],
+                                 'Type': dtype, 'Enrichment': enr})
 
-process_dfs(nopropdfs, 'noprop')
-process_dfs(propdfs, 'prop')
-
+process(nopropdfs, 'noprop'); process(propdfs, 'prop')
 df = pd.DataFrame(data)
-
-for df_type in ['noprop', 'prop']:
-    for enrichment in ['e', 'p']:
+for dtype in ['noprop', 'prop']:
+    for enr in ['e', 'p']:
+        sub = df[(df['Type'] == dtype) & (df['Enrichment'] == enr)]
+        if sub.empty:
+            continue
         plt.figure(figsize=(10, 6))
-        sns.barplot(x='Quantile Start', y='Relative Abundance %', hue='NS', data=df[(df['Type'] == df_type) & (df['Enrichment'] == enrichment)], palette='Set2', errorbar=None)
-        plt.title(f'Relative Abundances of CC, MF, and BP ({df_type}, {enrichment})')
-        plt.savefig(f'Relative Abundances of CC, MF, and BP ({df_type}, {enrichment}).png')
+        sns.barplot(x='Quantile Start', y='Relative Abundance %', hue='NS',
+                    data=sub, palette='Set2', errorbar=None)
+        plt.title(f'Relative Abundances CC/MF/BP ({dtype}, {enr})')
+        plt.savefig(f'CumRelAbundance_{dtype}_{enr}.png'); plt.close()
 END_SCRIPT
 
-    mkdir -p GO_results
+    command -v python3 >/dev/null 2>&1 || { echo "ERROR: 'python3' is not in PATH"; exit 1; }
+
+    mkdir -p GO_results CumulativeGO_results
     cp *.noprop *.prop GO_results/ 2>/dev/null || true
+    cp Cumulative*.noprop Cumulative*.prop CumulativeGO_results/ 2>/dev/null || true
 
-    mkdir -p CumulativeGO_results
-    cp GO_results/Cumulative*.noprop GO_results/Cumulative*.prop CumulativeGO_results/ 2>/dev/null || true
-
-    cd GO_results
-    python ../PlotGOHistograms.py || true
-    python ../GOstatgraphs.py || true
-    cd ..
-
-    cd CumulativeGO_results
-    python ../PlotGOHistogramsCumulative.py || true
-    python ../GOstatgraphsCumulative.py || true
-    cd ..
+    ( cd GO_results && python3 ../PlotGOHistograms.py && python3 ../GOstatgraphs.py ) || true
+    ( cd CumulativeGO_results && python3 ../PlotGOHistogramsCumulative.py && python3 ../GOstatgraphsCumulative.py ) || true
     '''
 }
 
+
+// ---- Stage 7: summary report (plots + tables + HTML) ----------------------
+process stage7_report {
+    publishDir "results", mode: 'copy'
+
+    input:
+    path dat_file
+    path quantile_stats
+    path intersect_files
+    path noprop_files
+    path prop_files
+    val win_size
+    val incr
+    val top_q
+
+    output:
+    path "report/*", emit: report_files, optional: true
+
+    shell:
+    '''
+    #!/bin/bash
+    set -eo pipefail
+
+    cat << 'END_SCRIPT' > make_report.py
+#!/usr/bin/env python3
+"""Summarise HGT pipeline output: genome track, score distribution,
+candidate regions and GO enrichment -> report/ (PNGs, TSVs, report.html)."""
+import base64
+import glob
+import io
+import os
+import sys
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import pandas as pd
+
+WIN = int(sys.argv[1])
+INCR = int(sys.argv[2])
+TOPQ = sys.argv[3] if len(sys.argv) > 3 else "0.95"
+
+OUT = "report"
+os.makedirs(OUT, exist_ok=True)
+
+ACCENT = "#c0392b"
+BASE = "#3b6ea5"
+GREY = "#8a8a8a"
+
+
+def read_quantiles():
+    q = {}
+    if os.path.exists("quantile_statistics.txt"):
+        for line in open("quantile_statistics.txt"):
+            parts = line.split(":")
+            if len(parts) == 2:
+                try:
+                    q[float(parts[0].split()[1])] = float(parts[1].strip())
+                except ValueError:
+                    pass
+    return q
+
+
+def read_dat():
+    files = [f for f in glob.glob("*.dat")]
+    if not files:
+        return None
+    df = pd.read_csv(files[0])
+    if not {"D2score", "Number", "Entropy"} <= set(df.columns):
+        return None
+    df = df.sort_values("Number").reset_index(drop=True)
+    df["start"] = (df["Number"] - 1) * INCR
+    df["end"] = df["start"] + WIN
+    df["mid"] = df["start"] + WIN // 2
+    return df
+
+
+def read_enrichment(path):
+    """Return the significant-terms table from a goatools output file."""
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        lines = fh.readlines()
+    start = next((i for i, l in enumerate(lines) if l.startswith("GO\\tNS\\t")), None)
+    if start is None:
+        return None
+    try:
+        df = pd.read_csv(io.StringIO("".join(lines[start:])), sep="\\t")
+    except Exception:
+        return None
+    return df if not df.empty else None
+
+
+def genes_by_segment(path):
+    """segment -> sorted list of CDS gene names, from a .intersect file."""
+    out = {}
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return out
+    try:
+        df = pd.read_csv(path, sep="\\t", header=None)
+    except Exception:
+        return out
+    if df.shape[1] < 15:
+        return out
+    df = df[df[8] == "CDS"]
+    for seg, grp in df.groupby(3):
+        names = set()
+        for attr in grp[14]:
+            for field in str(attr).split(";"):
+                if field.startswith("Name="):
+                    names.add(field.split("=", 1)[1])
+        try:
+            out[int(seg)] = sorted(names)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def b64(path):
+    with open(path, "rb") as fh:
+        return base64.b64encode(fh.read()).decode()
+
+
+dat = read_dat()
+quant = read_quantiles()
+thresh = quant.get(float(TOPQ))
+figs = []
+
+# ---------------------------------------------------------------- genome track
+if dat is not None:
+    fig, axs = plt.subplots(2, 1, figsize=(13, 7), sharex=True)
+    hi = dat[dat["D2score"] >= thresh] if thresh is not None else dat.iloc[0:0]
+    lo = dat.drop(hi.index)
+
+    axs[0].scatter(lo["mid"] / 1e6, lo["D2score"], s=16, color=BASE,
+                   alpha=.75, label="below threshold")
+    if not hi.empty:
+        axs[0].scatter(hi["mid"] / 1e6, hi["D2score"], s=48, color=ACCENT,
+                       edgecolor="black", linewidth=.4, zorder=3,
+                       label=f"top {(1 - float(TOPQ)) * 100:.0f}% candidates")
+    if thresh is not None:
+        axs[0].axhline(thresh, color=ACCENT, ls="--", lw=1,
+                       label=f"Q{TOPQ} = {thresh:.4g}")
+    axs[0].set_ylabel("KAST distance (D2score)")
+    axs[0].set_title(f"Compositional anomaly across the genome "
+                     f"({WIN:,} bp windows, {INCR:,} bp step)")
+    axs[0].legend(loc="upper right", fontsize=8, framealpha=.9)
+    axs[0].grid(alpha=.25)
+
+    axs[1].scatter(dat["mid"] / 1e6, dat["Entropy"], s=16, color=GREY, alpha=.8)
+    if not hi.empty:
+        axs[1].scatter(hi["mid"] / 1e6, hi["Entropy"], s=48, color=ACCENT,
+                       edgecolor="black", linewidth=.4, zorder=3)
+    axs[1].set_ylabel("min k-mer entropy")
+    axs[1].set_xlabel("genome position (Mb)")
+    axs[1].grid(alpha=.25)
+
+    fig.tight_layout()
+    p = f"{OUT}/01_genome_track.png"
+    fig.savefig(p, dpi=150)
+    plt.close(fig)
+    figs.append((p, "Genome-wide compositional signal. Red points are windows "
+                    "above the top-quantile threshold — the HGT candidates."))
+
+# --------------------------------------------------------- score distribution
+if dat is not None:
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.hist(dat["D2score"], bins=40, color=BASE, alpha=.85, edgecolor="white")
+    for q in (0.5, 0.9, float(TOPQ)):
+        if q in quant:
+            ax.axvline(quant[q], ls="--", lw=1.2,
+                       color=ACCENT if q == float(TOPQ) else GREY)
+            ax.text(quant[q], ax.get_ylim()[1] * .95, f" Q{q}", fontsize=8,
+                    color=ACCENT if q == float(TOPQ) else GREY, rotation=90,
+                    va="top")
+    ax.set_xlabel("KAST distance (D2score)")
+    ax.set_ylabel("windows")
+    ax.set_title("Distribution of window scores, with quantile cut-offs")
+    ax.grid(alpha=.25)
+    fig.tight_layout()
+    p = f"{OUT}/02_score_distribution.png"
+    fig.savefig(p, dpi=150)
+    plt.close(fig)
+    figs.append((p, "Where the quantile bins fall. The filtering thresholds are "
+                    "percentiles of this distribution, not absolute cut-offs."))
+
+# ------------------------------------------------------------ candidate table
+top_intersect = f"quantile_{TOPQ}_inf.intersect"
+seg_genes = genes_by_segment(top_intersect)
+cand = pd.DataFrame()
+if dat is not None and thresh is not None:
+    cand = dat[dat["D2score"] >= thresh].copy()
+    cand["n_genes"] = cand["Number"].map(lambda s: len(seg_genes.get(s, [])))
+    cand["genes"] = cand["Number"].map(
+        lambda s: ", ".join(seg_genes.get(s, [])[:12])
+        + (" ..." if len(seg_genes.get(s, [])) > 12 else ""))
+    cand = cand.sort_values("D2score", ascending=False)
+    cand[["Number", "start", "end", "D2score", "Entropy", "n_genes", "genes"]].to_csv(
+        f"{OUT}/candidate_regions.tsv", sep="\\t", index=False)
+
+# --------------------------------------------------------------- GO summary
+go_rows = []
+for path in sorted(glob.glob("*.go.prop")) + sorted(glob.glob("*.go.noprop")):
+    df = read_enrichment(path)
+    if df is None or "enrichment" not in df.columns:
+        continue
+    label = os.path.basename(path).split(".intersect")[0]
+    kind = "propagated" if path.endswith(".prop") else "non-propagated"
+    for _, r in df.iterrows():
+        go_rows.append({
+            "bin": label, "counts": kind, "GO": r.get("GO"),
+            "NS": r.get("NS"), "term": str(r.get("name", "")).strip(),
+            "e/p": r.get("enrichment"),
+            "study": r.get("ratio_in_study"), "pop": r.get("ratio_in_pop"),
+            "fold": r.get("fold_enrichment"),
+            "p_fdr_bh": r.get("p_fdr_bh"),
+        })
+go_df = pd.DataFrame(go_rows)
+if not go_df.empty:
+    go_df.to_csv(f"{OUT}/go_summary.tsv", sep="\\t", index=False)
+
+# ------------------------------------------------- GO barplot for the top bin
+top_bin = f"quantile_{TOPQ}_inf"
+top_go = go_df[(go_df["bin"] == top_bin) & (go_df["counts"] == "propagated")] \\
+    if not go_df.empty else pd.DataFrame()
+if not top_go.empty:
+    t = top_go.copy()
+    t["fold"] = pd.to_numeric(t["fold"], errors="coerce")
+    t = t.dropna(subset=["fold"]).sort_values("fold", ascending=True).tail(12)
+    if not t.empty:
+        fig, ax = plt.subplots(figsize=(9, max(3, .45 * len(t) + 1.5)))
+        colors = [ACCENT if e == "e" else BASE for e in t["e/p"]]
+        ax.barh([f"{g}  {n[:44]}" for g, n in zip(t["GO"], t["term"])],
+                t["fold"], color=colors)
+        ax.set_xlabel("fold enrichment")
+        ax.set_title(f"Enriched GO terms in the top {(1 - float(TOPQ)) * 100:.0f}% "
+                     f"of windows (propagated counts)")
+        ax.grid(alpha=.25, axis="x")
+        fig.tight_layout()
+        p = f"{OUT}/03_go_top_terms.png"
+        fig.savefig(p, dpi=150)
+        plt.close(fig)
+        figs.append((p, "Functional signal in the candidate set. Red = enriched, "
+                        "blue = purified."))
+
+# ------------------------------------------------------------------- summary
+n_windows = 0 if dat is None else len(dat)
+n_cand = 0 if cand.empty else len(cand)
+n_genes = len({g for s in (cand["Number"] if not cand.empty else [])
+               for g in seg_genes.get(s, [])})
+n_sig = 0 if go_df.empty else len(go_df[go_df["bin"] == top_bin])
+
+summary = [
+    ("Windows scored", f"{n_windows:,}"),
+    ("Window size / step", f"{WIN:,} bp / {INCR:,} bp"),
+    (f"Candidate windows (>= Q{TOPQ})", f"{n_cand:,}"),
+    ("Threshold score", "n/a" if thresh is None else f"{thresh:.6g}"),
+    ("Genes in candidate windows", f"{n_genes:,}"),
+    ("Significant GO terms (top bin)", f"{n_sig:,}"),
+    ("Quantile bins analysed",
+     f"{len(set(go_df['bin'])) if not go_df.empty else 0}"),
+]
+with open(f"{OUT}/summary.txt", "w") as fh:
+    for k, v in summary:
+        fh.write(f"{k}\\t{v}\\n")
+
+# ---------------------------------------------------------------- HTML report
+def table_html(df, maxrows=40):
+    if df is None or df.empty:
+        return "<p class='none'>No rows.</p>"
+    d = df.head(maxrows)
+    th = "".join(f"<th>{c}</th>" for c in d.columns)
+    tr = "".join("<tr>" + "".join(f"<td>{v}</td>" for v in row) + "</tr>"
+                 for row in d.values)
+    more = (f"<p class='none'>Showing {maxrows} of {len(df)} rows — "
+            f"full table in the TSV.</p>" if len(df) > maxrows else "")
+    return f"<table><thead><tr>{th}</tr></thead><tbody>{tr}</tbody></table>{more}"
+
+
+cand_cols = ["Number", "start", "end", "D2score", "Entropy", "n_genes", "genes"]
+html = [f"""<!doctype html><html><head><meta charset="utf-8">
+<title>HGT pipeline report</title><style>
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+margin:0 auto;max-width:1150px;padding:32px 24px;color:#222;line-height:1.5}}
+h1{{margin:0 0 4px;font-size:26px}} h2{{margin:34px 0 10px;font-size:18px;
+border-bottom:2px solid #eee;padding-bottom:6px}}
+.sub{{color:#777;margin-bottom:24px;font-size:14px}}
+.cards{{display:flex;flex-wrap:wrap;gap:12px;margin:18px 0}}
+.card{{border:1px solid #e3e3e3;border-radius:8px;padding:12px 16px;min-width:150px}}
+.card .v{{font-size:22px;font-weight:600;color:{ACCENT}}}
+.card .k{{font-size:12px;color:#666;text-transform:uppercase;letter-spacing:.4px}}
+img{{max-width:100%;border:1px solid #eee;border-radius:6px;margin-top:8px}}
+.cap{{color:#666;font-size:13px;margin:6px 0 0}}
+table{{border-collapse:collapse;width:100%;font-size:12.5px;margin-top:8px}}
+th,td{{border:1px solid #e6e6e6;padding:5px 8px;text-align:left}}
+th{{background:#f7f7f7}} tr:nth-child(even) td{{background:#fbfbfb}}
+.none{{color:#888;font-size:13px;font-style:italic}}
+code{{background:#f4f4f4;padding:1px 5px;border-radius:3px}}
+</style></head><body>
+<h1>HGT detection report</h1>
+<div class="sub">Alignment-free compositional scan &middot;
+{WIN:,} bp windows, {INCR:,} bp step &middot; candidates = top
+{(1 - float(TOPQ)) * 100:.0f}% of windows by KAST distance</div>
+<div class="cards">"""]
+for k, v in summary:
+    html.append(f"<div class='card'><div class='v'>{v}</div>"
+                f"<div class='k'>{k}</div></div>")
+html.append("</div>")
+
+for path, cap in figs:
+    title = {"01": "Where the candidates are",
+             "02": "Score distribution",
+             "03": "Functional enrichment"}[os.path.basename(path)[:2]]
+    html.append(f"<h2>{title}</h2><img src='data:image/png;base64,{b64(path)}'>"
+                f"<p class='cap'>{cap}</p>")
+
+html.append("<h2>Candidate regions</h2>")
+html.append(table_html(cand[cand_cols] if not cand.empty else pd.DataFrame()))
+html.append("<h2>Significant GO terms (top bin)</h2>")
+html.append(table_html(go_df[go_df["bin"] == top_bin].drop(columns=["bin"])
+                       if not go_df.empty else pd.DataFrame()))
+html.append("<p class='cap'>Full tables: <code>candidate_regions.tsv</code>, "
+            "<code>go_summary.tsv</code>. Per-bin enrichment output is in "
+            "<code>results/dist/</code>.</p></body></html>")
+
+with open(f"{OUT}/report.html", "w") as fh:
+    fh.write("\\n".join(html))
+
+print(f"Report written to {OUT}/report.html")
+for k, v in summary:
+    print(f"  {k}: {v}")
+
+END_SCRIPT
+
+    command -v python3 >/dev/null 2>&1 || { echo "ERROR: 'python3' is not in PATH"; exit 1; }
+
+    python3 make_report.py "!{win_size}" "!{incr}" "!{top_q}" || {
+        echo "WARNING: report generation failed; continuing"; mkdir -p report; }
+    '''
+}
+
+// ---- Workflow -------------------------------------------------------------
 workflow {
     def valid_stage3_modes = ["bwa", "coords"]
-    if( !valid_stage3_modes.contains(params.stage3_mode) ) {
+    if( !valid_stage3_modes.contains(params.stage3_mode) )
         error "Invalid --stage3_mode '${params.stage3_mode}'. Valid options: bwa, coords"
-    }
 
-    fasta_ch = Channel.fromPath(params.fasta)
+    int win  = params.window_size as int
+    int klen = params.kmer_length as int
+    int incr = (params.increment    != null) ? (params.increment    as int) : win.intdiv(2)
+    int entw = params.entropy_window as int
+    int enti = (params.entropy_incr != null) ? (params.entropy_incr as int) : entw.intdiv(2)
+
+    if( entw >= win )
+        error "entropy_window (${entw}) must be smaller than window_size (${win})"
+    if( incr < 1 || enti < 1 )
+        error "increment/entropy_incr must be >= 1"
+    if( klen < 1 || klen > 16 )
+        error """--kmer_length ${klen} is outside the usable range.
+       KAST allocates a dense 4^k array: k=14 needs ~1 GB, k=15 ~4 GB, k=16 ~16 GB,
+       and k>=20 is refused outright by KAST. Use a smaller k (KAST's default is 3)."""
+
+
+    log.info """
+    ------------------------------------------------------------------
+     HGT pipeline - resolved parameters
+    ------------------------------------------------------------------
+     genome            : ${params.fasta}
+     reference         : ${params.ref_genome}
+     annotation        : ${params.gff}
+     ontology          : ${params.obo}
+     window / step     : ${win} bp / ${incr} bp
+     k-mer length      : ${klen}
+     entropy win/step  : ${entw} bp / ${enti} bp
+     coordinate mode   : ${params.stage3_mode}
+     reference contig  : ${params.reference_contig ?: 'AUTO (single-contig)'}
+     candidate bin     : top ${((1 - (params.top_quantile as double)) * 100) as int}% (Q${params.top_quantile})
+     launch dir        : ${workflow.launchDir}
+    ------------------------------------------------------------------
+    """.stripIndent()
+
+    fasta_ch   = Channel.fromPath(params.fasta)
     ref_genome = file(params.ref_genome)
-    gff_file = file(params.gff)
-    cds_list = file(params.cds_list)
-    all_txt = file(params.all_txt)
-    go_txt = file(params.go_txt)
+    gff_file   = file(params.gff)
+    cds_list   = file(params.cds_list)
+    all_txt    = file(params.all_txt)
+    go_txt     = file(params.go_txt)
+    obo_file   = file(params.obo)
 
-    stage1_out = stage1(fasta_ch, params.window_size, params.kmer_length, params.increment)
+    stage1_out = stage1(fasta_ch, win, klen, incr, entw, enti)
     stage2_out = stage2(fasta_ch, stage1_out.dat_file, stage1_out.fwin_file)
-    def stage3_input = stage2_out.filtered_seqs.flatten()
+
+    stage3_input = stage2_out.filtered_seqs.flatten()
     def stage3_out
-    if( params.stage3_mode == "bwa" ) {
+    if( params.stage3_mode == "bwa" )
         stage3_out = stage3(stage3_input, ref_genome, gff_file)
-    }
-    else {
-        stage3_out = stage3_coords(stage3_input, ref_genome, gff_file, params.window_size as Integer, params.increment as Integer, params.reference_contig)
-    }
+    else
+        stage3_out = stage3_coords(stage3_input, ref_genome, gff_file, win, incr, (params.reference_contig ?: 'AUTO'))
+
     stage4_out = stage4(stage3_out.intersect_files, cds_list)
-    stage5_out = stage5(stage4_out.protein_files, all_txt, go_txt)
+    stage5_out = stage5(stage4_out.protein_files, all_txt, go_txt, obo_file)
     stage6(stage5_out.noprop.collect(), stage5_out.prop.collect())
+
+    stage7_report(
+        stage1_out.dat_file,
+        stage2_out.quantile_stats,
+        stage3_out.intersect_files.collect(),
+        stage5_out.noprop.collect(),
+        stage5_out.prop.collect(),
+        win, incr, params.top_quantile
+    )
+}
+
+workflow.onComplete {
+    log.info """
+    ------------------------------------------------------------------
+     ${workflow.success ? 'Completed successfully' : 'FAILED'}
+     duration : ${workflow.duration}
+     ${workflow.success ? "report   : ${workflow.launchDir}/results/report/report.html" : "error    : ${workflow.errorMessage ?: 'see .nextflow.log'}"}
+    ------------------------------------------------------------------
+    """.stripIndent()
 }
